@@ -15,30 +15,28 @@
 """AWS client management for Redshift MCP Server."""
 
 import asyncio
-import boto3
 import os
-import regex
 import time
+
+import boto3
+import regex
 from awslabs.redshift_mcp_server import __version__
-from awslabs.redshift_mcp_server.consts import (
-    CLIENT_CONNECT_TIMEOUT,
-    CLIENT_READ_TIMEOUT,
-    CLIENT_RETRIES,
-    CLIENT_USER_AGENT_NAME,
-    QUERY_POLL_INTERVAL,
-    QUERY_TIMEOUT,
-    SESSION_KEEPALIVE,
-    SUSPICIOUS_QUERY_MAX_LEN,
-    SUSPICIOUS_QUERY_REGEXP,
-    SUSPICIOUS_QUERY_TIMEOUT,
-    SVV_ALL_COLUMNS_QUERY,
-    SVV_ALL_SCHEMAS_QUERY,
-    SVV_ALL_TABLES_QUERY,
-    SVV_REDSHIFT_DATABASES_QUERY,
-)
+from awslabs.redshift_mcp_server.consts import (CLIENT_CONNECT_TIMEOUT,
+                                                CLIENT_READ_TIMEOUT,
+                                                CLIENT_RETRIES,
+                                                CLIENT_USER_AGENT_NAME,
+                                                QUERY_POLL_INTERVAL,
+                                                QUERY_TIMEOUT,
+                                                SESSION_KEEPALIVE,
+                                                SUSPICIOUS_QUERY_MAX_LEN,
+                                                SUSPICIOUS_QUERY_REGEXP,
+                                                SUSPICIOUS_QUERY_TIMEOUT,
+                                                SVV_ALL_COLUMNS_QUERY,
+                                                SVV_ALL_SCHEMAS_QUERY,
+                                                SVV_ALL_TABLES_QUERY,
+                                                SVV_REDSHIFT_DATABASES_QUERY)
 from botocore.config import Config
 from loguru import logger
-
 
 # Compile once; the pattern uses recursive subroutines so compilation is non-trivial.
 _SUSPICIOUS_QUERY_RE = regex.compile(SUSPICIOUS_QUERY_REGEXP)
@@ -280,7 +278,7 @@ async def _execute_protected_statement(
             raise Exception('SQL contains suspicious pattern, execution rejected')
 
     # Execute BEGIN statement
-    begin_sql = 'BEGIN READ WRITE;' if allow_read_write else 'BEGIN READ ONLY;'
+    begin_sql = 'BEGIN READ WRITE;' if allow_read_write else 'BEGIN;'
     await _execute_statement(
         cluster_info=cluster_info,
         cluster_identifier=cluster_identifier,
