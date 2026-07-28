@@ -249,7 +249,7 @@ async def _execute_protected_statement(
 
     Read-only (allow_read_write=False):
     1. Get or create session (with SET application_name).
-    2. BEGIN READ ONLY;
+    2. BEGIN;
     3. <user sql>
     4. ROLLBACK;  (always, so nothing is persisted and non-deny-listed writes are blocked)
 
@@ -305,13 +305,16 @@ async def _execute_protected_statement(
                 session_id=session_id,
             )
         else:
-            # Read-only: BEGIN READ ONLY ... ROLLBACK. The engine rejects data writes
-            # the deny-list does not enumerate; ROLLBACK discards anything uncommitted.
+            # Read-only: BEGIN ... ROLLBACK. Honor fork uses a plain BEGIN rather than
+            # BEGIN READ ONLY because our Redshift target does not reliably support the
+            # READ ONLY transaction mode; read-only protection therefore relies on the
+            # statement-type deny-list guard plus ROLLBACK, which discards anything
+            # uncommitted so nothing is persisted.
             await _execute_statement(
                 cluster_info=cluster_info,
                 cluster_identifier=cluster_identifier,
                 database_name=database_name,
-                sql='BEGIN READ ONLY;',
+                sql='BEGIN;',
                 session_id=session_id,
             )
 
