@@ -289,10 +289,10 @@ class TestExecuteProtectedStatement:
         # Verify session was created
         mock_session_manager.session.assert_called_once()
 
-        # Verify three statements were executed: BEGIN READ ONLY, user SQL, ROLLBACK
+        # Verify three statements were executed: BEGIN, user SQL, ROLLBACK
         assert mock_execute_statement.call_count == 3
         calls = mock_execute_statement.call_args_list
-        assert calls[0][1]['sql'] == 'BEGIN READ ONLY;'
+        assert calls[0][1]['sql'] == 'BEGIN;'
         assert calls[1][1]['sql'] == 'SELECT 1'
         assert calls[2][1]['sql'] == 'ROLLBACK;'
 
@@ -338,7 +338,7 @@ class TestExecuteProtectedStatement:
 
         # No transaction wrapper is issued in read-write mode.
         executed_sqls = [call[1]['sql'] for call in calls]
-        for wrapper in ('BEGIN READ WRITE;', 'BEGIN READ ONLY;', 'ROLLBACK;', 'END;'):
+        for wrapper in ('BEGIN;', 'BEGIN READ WRITE;', 'BEGIN READ ONLY;', 'ROLLBACK;', 'END;'):
             assert wrapper not in executed_sqls
 
         assert query_id == 'user-stmt-id'
@@ -568,7 +568,7 @@ class TestExecuteProtectedStatement:
         )
 
         def execute_side_effect(cluster_info, cluster_identifier, database_name, sql, **kwargs):
-            if sql == 'BEGIN READ ONLY;':
+            if sql == 'BEGIN;':
                 return 'begin-stmt-id'
             elif sql == 'SELECT invalid_syntax':
                 raise Exception('SQL syntax error')
@@ -586,7 +586,7 @@ class TestExecuteProtectedStatement:
         # Verify ROLLBACK was still called
         assert mock_execute_statement.call_count == 3
         calls = mock_execute_statement.call_args_list
-        assert calls[0][1]['sql'] == 'BEGIN READ ONLY;'
+        assert calls[0][1]['sql'] == 'BEGIN;'
         assert calls[1][1]['sql'] == 'SELECT invalid_syntax'
         assert calls[2][1]['sql'] == 'ROLLBACK;'
 
@@ -610,7 +610,7 @@ class TestExecuteProtectedStatement:
         )
 
         def execute_side_effect(cluster_info, cluster_identifier, database_name, sql, **kwargs):
-            if sql == 'BEGIN READ ONLY;':
+            if sql == 'BEGIN;':
                 return 'begin-stmt-id'
             elif sql == 'SELECT 1':
                 return 'user-stmt-id'
@@ -645,7 +645,7 @@ class TestExecuteProtectedStatement:
         )
 
         def execute_side_effect(cluster_info, cluster_identifier, database_name, sql, **kwargs):
-            if sql == 'BEGIN READ ONLY;':
+            if sql == 'BEGIN;':
                 return 'begin-stmt-id'
             elif sql == 'SELECT invalid_syntax':
                 raise Exception('SQL syntax error')
