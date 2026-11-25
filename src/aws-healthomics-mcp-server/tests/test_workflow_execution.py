@@ -15,7 +15,12 @@
 """Unit tests for workflow execution tools."""
 
 import botocore.exceptions
+import copy as _copy
+import inspect as _inspect
+import json
 import pytest
+from awslabs.aws_healthomics_mcp_server.consts import DEFAULT_SCRATCH_STORAGE_MODE
+from awslabs.aws_healthomics_mcp_server.tools import workflow_execution as _workflow_execution
 from awslabs.aws_healthomics_mcp_server.tools.workflow_execution import (
     get_run,
     get_run_task,
@@ -24,6 +29,9 @@ from awslabs.aws_healthomics_mcp_server.tools.workflow_execution import (
     start_run,
 )
 from datetime import datetime, timedelta, timezone
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from tests.test_helpers import MCPToolTestWrapper
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -689,6 +697,48 @@ async def test_list_runs_with_date_filters():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'created_after,created_before,expected_ids',
+    [
+        ('2023-06-10', None, ['run-2', 'run-3']),
+        ('2023-06-10T00:00', None, ['run-2', 'run-3']),
+        (None, '2023-06-20', ['run-1', 'run-2']),
+        ('2023-06-10', '2023-06-20T00:00', ['run-2']),
+    ],
+)
+async def test_list_runs_date_filters_without_utc_offset(
+    created_after, created_before, expected_ids
+):
+    """Date filters without a UTC offset are treated as UTC instead of failing."""
+    base_time = datetime(2023, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_client = MagicMock()
+    mock_client.list_runs.return_value = {
+        'items': [
+            {'id': 'run-1', 'creationTime': base_time - timedelta(days=10)},  # 2023-06-05
+            {'id': 'run-2', 'creationTime': base_time},  # 2023-06-15
+            {'id': 'run-3', 'creationTime': base_time + timedelta(days=10)},  # 2023-06-25
+        ]
+    }
+
+    with patch(
+        'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+        return_value=mock_client,
+    ):
+        result = await list_runs(
+            ctx=AsyncMock(),
+            max_results=10,
+            next_token=None,
+            status=None,
+            created_after=created_after,
+            created_before=created_before,
+            run_group_id=None,
+        )
+
+    assert 'error' not in result
+    assert [run['id'] for run in result['runs']] == expected_ids
+
+
+@pytest.mark.asyncio
 async def test_list_runs_with_created_before_filter():
     """Test listing runs with created_before filter."""
     base_time = datetime(2023, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -801,6 +851,110 @@ async def test_list_runs_with_both_date_filters():
     # Should return only run-2 (created between the two dates)
     assert len(result['runs']) == 1
     assert result['runs'][0]['id'] == 'run-2'
+
+
+@pytest.mark.asyncio
+async def test_list_runs_date_filter_truncation_emits_next_token():
+    """Test that truncating date-filtered results still signals continuation.
+
+    When client-side date filtering leaves more matching runs than max_results,
+    and the upstream API still has more pages available, the response must
+    include a nextToken so callers know the page is not the complete result set.
+    """
+    base_time = datetime(2023, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    # 15 runs all created after the created_after filter, fetched in a single
+    # upstream batch that itself still has more pages (nextToken present).
+    items = []
+    for i in range(15):
+        items.append(
+            {
+                'id': f'run-{i}',
+                'name': f'run-{i}',
+                'status': 'COMPLETED',
+                'workflowId': f'wfl-{i}',
+                'workflowType': 'WDL',
+                'creationTime': base_time + timedelta(days=i),
+            }
+        )
+
+    mock_response = {
+        'items': items,
+        'nextToken': 'upstream-token-abc',
+    }
+
+    mock_ctx = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.list_runs.return_value = mock_response
+
+    with patch(
+        'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+        return_value=mock_client,
+    ):
+        result = await list_runs(
+            ctx=mock_ctx,
+            max_results=10,
+            next_token=None,
+            status=None,
+            created_after='2023-06-10T00:00:00Z',
+            created_before=None,
+            run_group_id=None,
+        )
+
+    # Truncated to max_results, but more matching runs exist upstream.
+    assert len(result['runs']) == 10
+    assert 'nextToken' in result, (
+        'truncated date-filtered page must carry a continuation token so the '
+        'caller does not treat a partial result as complete'
+    )
+    assert result['nextToken'] == 'upstream-token-abc'
+
+
+@pytest.mark.asyncio
+async def test_list_runs_date_filter_truncation_no_upstream_token():
+    """Test truncated date-filtered results with no further upstream pages.
+
+    When the upstream API has no more pages (no nextToken), there is no valid
+    resume point to hand back even though the filtered set was truncated. The
+    response must omit nextToken rather than fabricate one.
+    """
+    base_time = datetime(2023, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    items = [
+        {
+            'id': f'run-{i}',
+            'name': f'run-{i}',
+            'status': 'COMPLETED',
+            'workflowId': f'wfl-{i}',
+            'workflowType': 'WDL',
+            'creationTime': base_time + timedelta(days=i),
+        }
+        for i in range(15)
+    ]
+
+    # No nextToken: this is the final upstream page.
+    mock_response = {'items': items}
+
+    mock_ctx = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.list_runs.return_value = mock_response
+
+    with patch(
+        'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+        return_value=mock_client,
+    ):
+        result = await list_runs(
+            ctx=mock_ctx,
+            max_results=10,
+            next_token=None,
+            status=None,
+            created_after='2023-06-10T00:00:00Z',
+            created_before=None,
+            run_group_id=None,
+        )
+
+    assert len(result['runs']) == 10
+    assert 'nextToken' not in result
 
 
 @pytest.mark.asyncio
@@ -947,6 +1101,14 @@ async def test_parse_iso_datetime_various_formats():
     dt3 = parse_iso_datetime('2023-06-15T12:00:00')
     assert dt3.year == 2023
 
+    # Inputs without an offset are treated as UTC
+    assert parse_iso_datetime('2023-06-15') == datetime(2023, 6, 15, tzinfo=timezone.utc)
+    assert parse_iso_datetime('2023-06-15T12:00') == datetime(2023, 6, 15, 12, tzinfo=timezone.utc)
+    # An explicit offset is kept, not overwritten with UTC
+    assert parse_iso_datetime('2023-06-15T12:00:00-05:00') == datetime(
+        2023, 6, 15, 17, tzinfo=timezone.utc
+    )
+
     # Test invalid format
     try:
         parse_iso_datetime('not-a-date')
@@ -1041,6 +1203,7 @@ async def test_start_run_success():
             run_group_id=None,
             networking_mode=None,
             configuration_name=None,
+            scratch_storage_mode=None,
         )
 
     # Verify client was called correctly
@@ -1051,6 +1214,7 @@ async def test_start_run_success():
         outputUri='s3://my-bucket/outputs/',
         parameters={'param1': 'value1'},
         storageType='DYNAMIC',
+        scratchStorageMode='LOCAL',
     )
 
     # Verify result contains expected fields
@@ -1096,6 +1260,7 @@ async def test_start_run_null_response_fields():
             run_group_id=None,
             networking_mode=None,
             configuration_name=None,
+            scratch_storage_mode=None,
         )
 
     assert result['id'] == 'run-99999'
@@ -1140,6 +1305,7 @@ async def test_start_run_with_static_storage():
             run_group_id=None,
             networking_mode=None,
             configuration_name=None,
+            scratch_storage_mode=None,
         )
 
     # Verify client was called with static storage parameters
@@ -1151,6 +1317,7 @@ async def test_start_run_with_static_storage():
         parameters={'param1': 'value1'},
         storageType='STATIC',
         storageCapacity=1000,
+        scratchStorageMode='LOCAL',
     )
 
 
@@ -1213,6 +1380,7 @@ async def test_start_run_with_cache():
             cache_behavior='CACHE_ALWAYS',
             networking_mode=None,
             configuration_name=None,
+            scratch_storage_mode=None,
         )
 
     # Verify client was called with cache parameters
@@ -1247,6 +1415,7 @@ async def test_start_run_boto_error():
             cache_behavior=None,
             networking_mode=None,
             configuration_name=None,
+            scratch_storage_mode=None,
         )
 
     # Verify error was reported to context and returned
@@ -1289,6 +1458,7 @@ async def test_start_run_client_error():
             cache_behavior=None,
             networking_mode=None,
             configuration_name=None,
+            scratch_storage_mode=None,
         )
 
     # Verify error was reported to context and returned with the S3 error message
@@ -1632,6 +1802,7 @@ async def test_start_run_boto_error_new():
                 cache_behavior=None,
                 networking_mode=None,
                 configuration_name=None,
+                scratch_storage_mode=None,
             )
 
     # Verify error was reported to context and returned
@@ -1669,6 +1840,7 @@ async def test_start_run_unexpected_error_new():
                 cache_behavior=None,
                 networking_mode=None,
                 configuration_name=None,
+                scratch_storage_mode=None,
             )
 
     # Verify error was reported to context and returned
@@ -2017,3 +2189,1100 @@ async def test_get_run_task_unexpected_error():
     # Verify error was reported to context
     mock_ctx.error.assert_called_once()
     assert 'Error getting task task-12345 for run run-12345' in mock_ctx.error.call_args[0][0]
+
+
+# Feature: local-temp-storage, Property: start_run forwards the effective scratch storage mode
+class TestStartRunForwardsEffectiveScratchStorageMode:
+    """start_run forwards the effective scratch storage mode to the HealthOmics API.
+
+    For any caller input where scratch_storage_mode is either a valid member of
+    SCRATCH_STORAGE_MODES or None, when start_run successfully starts a run, the
+    scratchStorageMode value passed to the HealthOmics start_run API equals the effective
+    mode - the caller-provided value when non-null, or LOCAL when the caller value is None.
+
+    Validates: Requirements 1.1, 1.2, 1.3, 1.4, 2.1, 2.4
+    """
+
+    _base_params = {
+        'workflow_id': 'wfl-12345',
+        'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+        'name': 'test-run',
+        'output_uri': 's3://my-bucket/outputs/',
+        'parameters': {'param1': 'value1'},
+    }
+
+    @given(scratch_storage_mode=st.one_of(st.sampled_from(['LOCAL', 'SHARED']), st.none()))
+    @settings(max_examples=100)
+    @pytest.mark.asyncio
+    async def test_start_run_forwards_effective_scratch_storage_mode(self, scratch_storage_mode):
+        """The scratchStorageMode kwarg passed to the API equals the effective mode."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = {
+            'id': 'run-12345',
+            'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+            'status': 'PENDING',
+            'name': 'test-run',
+            'workflowId': 'wfl-12345',
+            'uuid': 'uuid-abc-123',
+            'tags': {},
+        }
+
+        start_run_wrapper = MCPToolTestWrapper(start_run)
+
+        expected_mode = (
+            scratch_storage_mode
+            if scratch_storage_mode is not None
+            else DEFAULT_SCRATCH_STORAGE_MODE
+        )
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await start_run_wrapper.call(
+                ctx=mock_ctx,
+                **self._base_params,
+                scratch_storage_mode=scratch_storage_mode,
+            )
+
+        assert 'error' not in result, (
+            f'Unexpected error for scratch_storage_mode={scratch_storage_mode!r}: {result}'
+        )
+        mock_client.start_run.assert_called_once()
+        call_kwargs = mock_client.start_run.call_args.kwargs
+        assert 'scratchStorageMode' in call_kwargs, (
+            'scratchStorageMode should always be forwarded to the API'
+        )
+        assert call_kwargs['scratchStorageMode'] == expected_mode
+
+
+# Feature: local-temp-storage, Property: start_run response reports the effective scratch
+# storage mode
+class TestStartRunResponseReportsEffectiveScratchStorageMode:
+    """start_run reports the effective scratch storage mode in its response.
+
+    For any caller input where scratch_storage_mode is a valid member of
+    SCRATCH_STORAGE_MODES or None, when start_run succeeds, the scratchStorageMode field in
+    its response dictionary equals the effective mode that was passed to the HealthOmics
+    start_run API (the caller value when non-null, otherwise LOCAL).
+
+    Validates: Requirements Exposing the scratch storage mode in tool responses
+    """
+
+    _base_params = {
+        'workflow_id': 'wfl-12345',
+        'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+        'name': 'test-run',
+        'output_uri': 's3://my-bucket/outputs/',
+        'parameters': {'param1': 'value1'},
+    }
+
+    @given(scratch_storage_mode=st.one_of(st.sampled_from(['LOCAL', 'SHARED']), st.none()))
+    @settings(max_examples=100)
+    @pytest.mark.asyncio
+    async def test_start_run_response_reports_effective_scratch_storage_mode(
+        self, scratch_storage_mode
+    ):
+        """The response scratchStorageMode equals the effective mode and the API value."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = {
+            'id': 'run-12345',
+            'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+            'status': 'PENDING',
+            'name': 'test-run',
+            'workflowId': 'wfl-12345',
+            'uuid': 'uuid-abc-123',
+            'tags': {},
+        }
+
+        start_run_wrapper = MCPToolTestWrapper(start_run)
+
+        expected_mode = (
+            scratch_storage_mode
+            if scratch_storage_mode is not None
+            else DEFAULT_SCRATCH_STORAGE_MODE
+        )
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await start_run_wrapper.call(
+                ctx=mock_ctx,
+                **self._base_params,
+                scratch_storage_mode=scratch_storage_mode,
+            )
+
+        assert 'error' not in result, (
+            f'Unexpected error for scratch_storage_mode={scratch_storage_mode!r}: {result}'
+        )
+        # The response reports the effective mode.
+        assert result['scratchStorageMode'] == expected_mode
+        # And it matches the value forwarded to the HealthOmics API.
+        mock_client.start_run.assert_called_once()
+        call_kwargs = mock_client.start_run.call_args.kwargs
+        assert result['scratchStorageMode'] == call_kwargs['scratchStorageMode']
+
+
+# Feature: local-temp-storage, Property: start_run response preserves the pre-scratch-storage
+# schema
+class TestStartRunResponsePreservesPreScratchStorageSchema:
+    """start_run response preserves every legacy field plus the new scratchStorageMode.
+
+    For any valid caller input and HealthOmics start_run API response, when start_run
+    succeeds, every field present in the pre-scratch-storage response schema (id, arn,
+    status, name, workflowId, workflowVersionName, outputUri, runGroupId, tags, uuid,
+    networkingMode) is present with unchanged name, type, and value, in addition to the new
+    scratchStorageMode field.
+
+    Validates: Requirements Backward compatibility
+    """
+
+    # Safe, non-empty printable strings for ids/names/values.
+    _text = st.text(
+        alphabet=st.characters(min_codepoint=48, max_codepoint=122),
+        min_size=1,
+        max_size=20,
+    )
+
+    @given(
+        scratch_storage_mode=st.one_of(st.sampled_from(['LOCAL', 'SHARED']), st.none()),
+        run_id=_text,
+        arn=_text,
+        status=st.sampled_from(['PENDING', 'STARTING', 'RUNNING', 'COMPLETED']),
+        uuid=_text,
+        name=_text,
+        workflow_id=_text,
+        workflow_version_name=st.one_of(st.none(), _text),
+        run_group_id=st.one_of(st.none(), _text),
+        tags=st.one_of(
+            st.none(),
+            st.dictionaries(keys=_text, values=_text, max_size=3),
+        ),
+    )
+    @settings(max_examples=100)
+    @pytest.mark.asyncio
+    async def test_start_run_response_preserves_legacy_schema(
+        self,
+        scratch_storage_mode,
+        run_id,
+        arn,
+        status,
+        uuid,
+        name,
+        workflow_id,
+        workflow_version_name,
+        run_group_id,
+        tags,
+    ):
+        """Every legacy field is present with unchanged name/type/value, plus the new field."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+
+        # Build the API response. tags is omitted entirely when None to exercise the
+        # response.get('tags', {}) default path.
+        api_response = {
+            'id': run_id,
+            'arn': arn,
+            'status': status,
+            'uuid': uuid,
+        }
+        if tags is not None:
+            api_response['tags'] = tags
+        mock_client.start_run.return_value = api_response
+
+        # output_uri already ends with '/' so ensure_s3_uri_ends_with_slash leaves it stable.
+        output_uri = 's3://my-bucket/outputs/'
+
+        # Expected legacy values: some derived from inputs, some from the API response.
+        expected_tags = tags if tags is not None else {}
+        expected = {
+            'id': run_id,
+            'arn': arn,
+            'status': status,
+            'name': name,
+            'workflowId': workflow_id,
+            'workflowVersionName': workflow_version_name,
+            'outputUri': output_uri,
+            'runGroupId': run_group_id,
+            'tags': expected_tags,
+            'uuid': uuid,
+            'networkingMode': 'RESTRICTED',  # defaults when networking_mode is None
+        }
+
+        call_params = {
+            'workflow_id': workflow_id,
+            'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+            'name': name,
+            'output_uri': output_uri,
+            'parameters': {'param1': 'value1'},
+            'run_group_id': run_group_id,
+        }
+        if workflow_version_name is not None:
+            call_params['workflow_version_name'] = workflow_version_name
+
+        wrapper = MCPToolTestWrapper(start_run)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await wrapper.call(
+                ctx=mock_ctx,
+                scratch_storage_mode=scratch_storage_mode,
+                **call_params,
+            )
+
+        assert 'error' not in result, (
+            f'Unexpected error for scratch_storage_mode={scratch_storage_mode!r}: {result}'
+        )
+
+        # Every legacy field is present with unchanged name, type, and value.
+        for field, expected_value in expected.items():
+            assert field in result, f'Legacy field {field!r} missing from response'
+            assert result[field] == expected_value, (
+                f'Legacy field {field!r} changed value: {result[field]!r} != {expected_value!r}'
+            )
+            assert type(result[field]) is type(expected_value), (
+                f'Legacy field {field!r} changed type: '
+                f'{type(result[field])} != {type(expected_value)}'
+            )
+
+        # The new scratchStorageMode field is also present.
+        assert 'scratchStorageMode' in result
+
+
+# ---------------------------------------------------------------------------
+# Scratch storage mode example tests (Feature: local-temp-storage)
+# ---------------------------------------------------------------------------
+def _build_start_run_response():
+    """Build a minimal successful start_run API response for example tests."""
+    return {
+        'id': 'run-scratch-1',
+        'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-scratch-1',
+        'status': 'PENDING',
+        'name': 'scratch-run',
+        'workflowId': 'wfl-scratch',
+        'uuid': 'uuid-scratch-1',
+        'tags': {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_run_scratch_storage_mode_local_happy_path():
+    """LOCAL is forwarded to the API and echoed in the response.
+
+    Validates: Requirements Scratch storage mode parameter on the single-run tool,
+    Exposing the scratch storage mode in tool responses.
+    """
+    mock_ctx = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.start_run.return_value = _build_start_run_response()
+    wrapper = MCPToolTestWrapper(start_run)
+
+    with patch(
+        'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+        return_value=mock_client,
+    ):
+        result = await wrapper.call(
+            mock_ctx,
+            workflow_id='wfl-scratch',
+            role_arn='arn:aws:iam::123456789012:role/HealthOmicsRole',
+            name='scratch-run',
+            output_uri='s3://my-bucket/outputs/',
+            parameters={'param1': 'value1'},
+            scratch_storage_mode='LOCAL',
+        )
+
+    # The HealthOmics API received scratchStorageMode=LOCAL
+    call_kwargs = mock_client.start_run.call_args.kwargs
+    assert call_kwargs['scratchStorageMode'] == 'LOCAL'
+    # And the tool echoes the effective mode back to the caller
+    assert result['scratchStorageMode'] == 'LOCAL'
+
+
+@pytest.mark.asyncio
+async def test_start_run_scratch_storage_mode_shared_happy_path():
+    """SHARED is forwarded to the API and echoed in the response.
+
+    Validates: Requirements Scratch storage mode parameter on the single-run tool,
+    Exposing the scratch storage mode in tool responses.
+    """
+    mock_ctx = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.start_run.return_value = _build_start_run_response()
+    wrapper = MCPToolTestWrapper(start_run)
+
+    with patch(
+        'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+        return_value=mock_client,
+    ):
+        result = await wrapper.call(
+            mock_ctx,
+            workflow_id='wfl-scratch',
+            role_arn='arn:aws:iam::123456789012:role/HealthOmicsRole',
+            name='scratch-run',
+            output_uri='s3://my-bucket/outputs/',
+            parameters={'param1': 'value1'},
+            scratch_storage_mode='SHARED',
+        )
+
+    call_kwargs = mock_client.start_run.call_args.kwargs
+    assert call_kwargs['scratchStorageMode'] == 'SHARED'
+    assert result['scratchStorageMode'] == 'SHARED'
+
+
+@pytest.mark.asyncio
+async def test_start_run_scratch_storage_mode_omitted_defaults_to_local():
+    """Omitting scratch_storage_mode applies the MCP default LOCAL.
+
+    Validates: Requirements MCP server defaults to LOCAL scratch storage,
+    Backward compatibility.
+    """
+    mock_ctx = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.start_run.return_value = _build_start_run_response()
+    wrapper = MCPToolTestWrapper(start_run)
+
+    with patch(
+        'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+        return_value=mock_client,
+    ):
+        result = await wrapper.call(
+            mock_ctx,
+            workflow_id='wfl-scratch',
+            role_arn='arn:aws:iam::123456789012:role/HealthOmicsRole',
+            name='scratch-run',
+            output_uri='s3://my-bucket/outputs/',
+            parameters={'param1': 'value1'},
+            # scratch_storage_mode intentionally omitted -> defaults to LOCAL
+        )
+
+    call_kwargs = mock_client.start_run.call_args.kwargs
+    assert call_kwargs['scratchStorageMode'] == 'LOCAL'
+    assert result['scratchStorageMode'] == 'LOCAL'
+
+
+@pytest.mark.asyncio
+async def test_start_run_scratch_storage_misconfigured_default_rejected():
+    """A misconfigured (invalid) MCP default is rejected without calling the API.
+
+    Validates: Requirements Backward compatibility (misconfigured default rejection).
+    """
+    mock_ctx = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.start_run.return_value = _build_start_run_response()
+    wrapper = MCPToolTestWrapper(start_run)
+
+    with (
+        patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ),
+        patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.DEFAULT_SCRATCH_STORAGE_MODE',
+            'INVALID',
+        ),
+    ):
+        result = await wrapper.call(
+            mock_ctx,
+            workflow_id='wfl-scratch',
+            role_arn='arn:aws:iam::123456789012:role/HealthOmicsRole',
+            name='scratch-run',
+            output_uri='s3://my-bucket/outputs/',
+            parameters={'param1': 'value1'},
+            # scratch_storage_mode omitted -> resolves to the misconfigured default
+        )
+
+    # The request is rejected with an error and the API is never invoked
+    assert 'error' in result
+    assert 'INVALID' in result['error']
+    mock_client.start_run.assert_not_called()
+
+
+def test_start_run_scratch_storage_mode_parameter_description():
+    """The parameter description documents LOCAL, SHARED, their meaning, and the LOCAL default.
+
+    Validates: Requirements Scratch storage mode parameter on the single-run tool
+    (parameter documentation).
+    """
+    signature = _inspect.signature(_workflow_execution.start_run)
+    field_info = signature.parameters['scratch_storage_mode'].default
+    description = field_info.description
+
+    assert description is not None
+    assert 'LOCAL' in description
+    assert 'SHARED' in description
+    # Mentions the meaning of each value
+    assert 'ephemeral' in description.lower()
+    assert 'shared scratch storage' in description.lower()
+    # Mentions that the MCP server default is LOCAL
+    assert 'default' in description.lower()
+
+
+# Feature: local-temp-storage, Property: start_run rejects any invalid scratch storage mode
+# without calling the API
+class TestStartRunRejectsInvalidScratchStorageMode:
+    """start_run rejects any invalid scratch storage mode without calling the API.
+
+    For any non-null scratch_storage_mode value that is not an exact (case-sensitive) member of
+    SCRATCH_STORAGE_MODES -- including case variants, empty strings, and whitespace-only strings
+    -- start_run returns an error response that names the rejected value and lists all allowed
+    values, leaves caller-provided run inputs unchanged, and never calls the HealthOmics
+    start_run API.
+
+    **Validates: Requirements Scratch storage mode parameter on the single-run tool, MCP server
+    defaults to LOCAL scratch storage, Validation of the scratch storage mode value**
+    """
+
+    @given(
+        scratch_storage_mode=st.one_of(
+            # Arbitrary text that is not an exact valid mode.
+            st.text().filter(lambda value: value not in ('LOCAL', 'SHARED')),
+            # Explicit edge cases: case variants, surrounding whitespace, empty, whitespace-only.
+            st.sampled_from(
+                [
+                    'local',
+                    'Shared',
+                    'Local',
+                    'LOCAL ',
+                    ' LOCAL',
+                    '',
+                    '   ',
+                    '\t',
+                    '\n',
+                ]
+            ),
+        )
+    )
+    @settings(max_examples=100)
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_mode_without_calling_api(self, scratch_storage_mode):
+        """Invalid modes are rejected; API not called; caller inputs unchanged."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+
+        # Caller-provided run inputs that must be left unchanged.
+        parameters = {'param1': 'value1'}
+        original_parameters = _copy.deepcopy(parameters)
+
+        start_run_wrapper = MCPToolTestWrapper(start_run)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await start_run_wrapper.call(
+                ctx=mock_ctx,
+                workflow_id='wfl-12345',
+                role_arn='arn:aws:iam::123456789012:role/HealthOmicsRole',
+                name='test-run',
+                output_uri='s3://my-bucket/outputs/',
+                parameters=parameters,
+                scratch_storage_mode=scratch_storage_mode,
+            )
+
+        # An error response is returned.
+        assert 'error' in result, f'Expected an error response, got: {result}'
+        error_message = result['error']
+
+        # The error names the rejected value and lists all allowed values.
+        assert str(scratch_storage_mode) in error_message
+        assert 'LOCAL' in error_message
+        assert 'SHARED' in error_message
+
+        # The HealthOmics start_run API was never called.
+        mock_client.start_run.assert_not_called()
+
+        # Caller-provided run inputs are left unchanged.
+        assert parameters == original_parameters
+
+
+# Feature: local-temp-storage, Property: get_run passes the scratch storage mode through
+# unchanged
+class TestGetRunPassesScratchStorageModeThrough:
+    """get_run passes the scratch storage mode through unchanged.
+
+    For any HealthOmics get_run API response, when the response contains a scratchStorageMode
+    field, the get_run tool result contains a scratchStorageMode field equal to that value
+    unchanged; and when the API response does not contain a scratchStorageMode field, the
+    get_run tool result does not contain a scratchStorageMode field at all.
+
+    Validates: Requirements Exposing the scratch storage mode in tool responses
+    """
+
+    @given(
+        # None is the sentinel meaning "scratchStorageMode is absent from the API response".
+        # Any other value (the documented LOCAL/SHARED modes plus arbitrary text) means the
+        # field is present and must pass through unchanged.
+        scratch_storage_mode=st.one_of(
+            st.none(),
+            st.sampled_from(['LOCAL', 'SHARED']),
+            st.text(),
+        ),
+    )
+    @settings(max_examples=100)
+    @pytest.mark.asyncio
+    async def test_get_run_passes_scratch_storage_mode_through(self, scratch_storage_mode):
+        """get_run includes scratchStorageMode only when the API response contains it."""
+        creation_time = datetime.now(timezone.utc)
+
+        # Build the HealthOmics get_run API response with the fields get_run reads.
+        mock_response = {
+            'id': 'run-12345',
+            'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+            'name': 'test-run',
+            'status': 'COMPLETED',
+            'workflowId': 'wfl-12345',
+            'workflowType': 'WDL',
+            'creationTime': creation_time,
+            'outputUri': 's3://bucket/output/',
+            'roleArn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+            'runOutputUri': 's3://bucket/run-output/',
+        }
+
+        # The sentinel None means the field is absent from the API response.
+        field_present = scratch_storage_mode is not None
+        if field_present:
+            mock_response['scratchStorageMode'] = scratch_storage_mode
+
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.get_run.return_value = mock_response
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await get_run(mock_ctx, run_id='run-12345')
+
+        assert 'error' not in result, f'Unexpected error response: {result}'
+
+        if field_present:
+            # When the API response contains scratchStorageMode, the result contains it
+            # unchanged.
+            assert 'scratchStorageMode' in result
+            assert result['scratchStorageMode'] == scratch_storage_mode
+        else:
+            # When the API response omits scratchStorageMode, the result omits it entirely.
+            assert 'scratchStorageMode' not in result
+
+
+# Feature: run-log-level, Property: start_run forwards logLevel only when provided
+class TestStartRunLogLevel:
+    """start_run handling of the optional log_level parameter.
+
+    - When log_level is None (default), no logLevel key is forwarded to the HealthOmics
+      start_run API, preserving backward-compatible behavior and the API default.
+    - When log_level is a valid enum value (OFF, FATAL, ERROR, ALL), it is forwarded to
+      the API and reflected in the response.
+    - When log_level is invalid, a validation error is returned and the API is not called.
+    """
+
+    _base_params = {
+        'workflow_id': 'wfl-12345',
+        'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+        'name': 'test-run',
+        'output_uri': 's3://my-bucket/outputs/',
+        'parameters': {'param1': 'value1'},
+    }
+
+    _api_response = {
+        'id': 'run-12345',
+        'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+        'status': 'PENDING',
+        'name': 'test-run',
+        'workflowId': 'wfl-12345',
+        'uuid': 'uuid-abc-123',
+        'tags': {},
+    }
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_log_level_when_none(self):
+        """log_level=None => no logLevel key in the params passed to the API."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        wrapper = MCPToolTestWrapper(start_run)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await wrapper.call(
+                ctx=mock_ctx,
+                **self._base_params,
+                log_level=None,
+            )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        mock_client.start_run.assert_called_once()
+        call_kwargs = mock_client.start_run.call_args.kwargs
+        assert 'logLevel' not in call_kwargs, (
+            'logLevel must not be forwarded when the caller omits it'
+        )
+        # Response still surfaces the (None) effective value for observability.
+        assert result['logLevel'] is None
+
+    @pytest.mark.parametrize('log_level', ['OFF', 'FATAL', 'ERROR', 'ALL'])
+    @pytest.mark.asyncio
+    async def test_start_run_forwards_valid_log_level(self, log_level):
+        """Each valid enum value is forwarded to the API and reflected in the response."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        wrapper = MCPToolTestWrapper(start_run)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await wrapper.call(
+                ctx=mock_ctx,
+                **self._base_params,
+                log_level=log_level,
+            )
+
+        assert 'error' not in result, f'Unexpected error for log_level={log_level!r}: {result}'
+        mock_client.start_run.assert_called_once()
+        call_kwargs = mock_client.start_run.call_args.kwargs
+        assert call_kwargs['logLevel'] == log_level
+        assert result['logLevel'] == log_level
+
+    @pytest.mark.asyncio
+    async def test_start_run_invalid_log_level_returns_error(self):
+        """An invalid log_level returns a validation error and never calls the API."""
+        mock_ctx = AsyncMock()
+        mock_client = MagicMock()
+
+        wrapper = MCPToolTestWrapper(start_run)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await wrapper.call(
+                ctx=mock_ctx,
+                **self._base_params,
+                log_level='INVALID',
+            )
+
+        assert 'error' in result
+        mock_client.start_run.assert_not_called()
+
+
+class TestStartRunTags:
+    """start_run handling of the optional tags parameter.
+
+    - When tags is omitted (None), no tags key is forwarded to the HealthOmics API.
+    - When tags are provided (including an empty dict), they are forwarded unchanged.
+    """
+
+    _base_params = {
+        'workflow_id': 'wfl-12345',
+        'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+        'name': 'test-run',
+        'output_uri': 's3://my-bucket/outputs/',
+        'parameters': {'param1': 'value1'},
+    }
+
+    _api_response = {
+        'id': 'run-12345',
+        'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+        'status': 'PENDING',
+        'uuid': 'uuid-abc-123',
+    }
+
+    async def _call(self, mock_client, **kwargs):
+        wrapper = MCPToolTestWrapper(start_run)
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            return await wrapper.call(ctx=AsyncMock(), **self._base_params, **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_start_run_forwards_tags(self):
+        """Provided tags are forwarded to the API and reflected in the response."""
+        tags = {'project': 'genomics', 'cost-center': '1234'}
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = {**self._api_response, 'tags': tags}
+
+        result = await self._call(mock_client, tags=tags)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        mock_client.start_run.assert_called_once()
+        assert mock_client.start_run.call_args.kwargs['tags'] == tags
+        assert result['tags'] == tags
+
+    @pytest.mark.asyncio
+    async def test_start_run_forwards_empty_tags(self):
+        """An explicit empty tags dict is forwarded, matching CreateAHORunGroup."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, tags={})
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert mock_client.start_run.call_args.kwargs['tags'] == {}
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_tags_when_not_provided(self):
+        """tags=None => no tags key in the params passed to the API."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, tags=None)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        mock_client.start_run.assert_called_once()
+        assert 'tags' not in mock_client.start_run.call_args.kwargs
+        assert result['tags'] == {}
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_tags_when_called_directly_without_tags(self):
+        """Calling start_run directly (unresolved Field default) does not forward tags."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await start_run(
+                AsyncMock(),
+                workflow_version_name=None,
+                storage_type='DYNAMIC',
+                storage_capacity=None,
+                cache_id=None,
+                cache_behavior=None,
+                run_group_id=None,
+                networking_mode=None,
+                configuration_name=None,
+                scratch_storage_mode='LOCAL',
+                log_level=None,
+                aws_profile=None,
+                aws_region=None,
+                **self._base_params,
+            )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert 'tags' not in mock_client.start_run.call_args.kwargs
+
+
+class TestStartRunSessionPolicy:
+    """start_run handling of the optional session_policy parameter."""
+
+    _base_params = {
+        'workflow_id': 'wfl-12345',
+        'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+        'name': 'test-run',
+        'output_uri': 's3://my-bucket/outputs/',
+        'parameters': {'param1': 'value1'},
+    }
+
+    _api_response = {
+        'id': 'run-12345',
+        'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+        'status': 'PENDING',
+        'uuid': 'uuid-abc-123',
+    }
+
+    _policy = {
+        'Version': '2012-10-17',
+        'Statement': [
+            {'Effect': 'Allow', 'Action': 's3:GetObject', 'Resource': 'arn:aws:s3:::my-bucket/*'}
+        ],
+    }
+
+    async def _call(self, mock_client, **kwargs):
+        wrapper = MCPToolTestWrapper(start_run)
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            return await wrapper.call(ctx=AsyncMock(), **self._base_params, **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_start_run_forwards_session_policy_string(self):
+        """A minified JSON string policy is forwarded to the API unchanged."""
+        policy_str = json.dumps(self._policy, separators=(',', ':'))
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, session_policy=policy_str)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert mock_client.start_run.call_args.kwargs['sessionPolicy'] == policy_str
+
+    @pytest.mark.asyncio
+    async def test_start_run_serializes_session_policy_dict(self):
+        """A dict policy is serialized to a JSON string before being forwarded."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, session_policy=self._policy)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        forwarded = mock_client.start_run.call_args.kwargs['sessionPolicy']
+        assert isinstance(forwarded, str)
+        assert json.loads(forwarded) == self._policy
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_session_policy_when_not_provided(self):
+        """session_policy=None => no sessionPolicy key in the params passed to the API."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, session_policy=None)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert 'sessionPolicy' not in mock_client.start_run.call_args.kwargs
+
+    @pytest.mark.parametrize('session_policy', ['not json', '[1, 2]', '{}', 'x' * 3000])
+    @pytest.mark.asyncio
+    async def test_start_run_invalid_session_policy_returns_error(self, session_policy):
+        """An invalid session policy returns an error and never calls the API."""
+        mock_client = MagicMock()
+
+        result = await self._call(mock_client, session_policy=session_policy)
+
+        assert 'error' in result
+        assert 'Invalid session policy' in result['error']
+        mock_client.start_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_session_policy_when_called_directly(self):
+        """Calling start_run directly (unresolved Field default) does not forward it."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await start_run(
+                AsyncMock(),
+                workflow_version_name=None,
+                storage_type='DYNAMIC',
+                storage_capacity=None,
+                cache_id=None,
+                cache_behavior=None,
+                run_group_id=None,
+                networking_mode=None,
+                configuration_name=None,
+                scratch_storage_mode='LOCAL',
+                log_level=None,
+                tags=None,
+                aws_profile=None,
+                aws_region=None,
+                **self._base_params,
+            )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert 'sessionPolicy' not in mock_client.start_run.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_get_run_surfaces_session_policy(self):
+        """get_run includes sessionPolicy when the API returns it."""
+        policy_str = json.dumps(self._policy)
+        mock_client = MagicMock()
+        mock_client.get_run.return_value = {
+            'id': 'run-12345',
+            'status': 'RUNNING',
+            'sessionPolicy': policy_str,
+        }
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await get_run(AsyncMock(), run_id='run-12345')
+
+        assert result['sessionPolicy'] == policy_str
+
+    @pytest.mark.asyncio
+    async def test_start_run_params_validate_against_botocore_model(self):
+        """The forwarded params, including sessionPolicy, satisfy the real StartRun shape."""
+        import botocore.session
+        from botocore.validate import ParamValidator
+
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        await self._call(mock_client, session_policy=self._policy)
+
+        input_shape = (
+            botocore.session.get_session()
+            .get_service_model('omics')
+            .operation_model('StartRun')
+            .input_shape
+        )
+        # requestId is an idempotency token that boto3 auto-populates on real clients
+        params = {'requestId': 'test-token', **mock_client.start_run.call_args.kwargs}
+        report = ParamValidator().validate(params, input_shape)
+        assert not report.has_errors(), report.generate_report()
+
+
+class TestStartRunOutputUriPrefixMode:
+    """start_run and get_run handling of the optional output URI prefix mode.
+
+    - When output_uri_prefix_mode is omitted, no outputUriPrefixMode key is forwarded, so
+      the HealthOmics API default (SERVICE_DEFINED) applies.
+    - A valid value is forwarded to the API and reflected in the response.
+    - An invalid value returns a validation error and the API is not called.
+    - get_run returns outputUriPrefixMode only when the API response contains it.
+    """
+
+    _base_params = {
+        'workflow_id': 'wfl-12345',
+        'role_arn': 'arn:aws:iam::123456789012:role/HealthOmicsRole',
+        'name': 'test-run',
+        'output_uri': 's3://my-bucket/outputs/',
+        'parameters': {'param1': 'value1'},
+    }
+
+    _api_response = {
+        'id': 'run-12345',
+        'arn': 'arn:aws:omics:us-east-1:123456789012:run/run-12345',
+        'status': 'PENDING',
+        'uuid': 'uuid-abc-123',
+    }
+
+    async def _call(self, mock_client, **kwargs):
+        wrapper = MCPToolTestWrapper(start_run)
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            return await wrapper.call(ctx=AsyncMock(), **self._base_params, **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_output_uri_prefix_mode_when_none(self):
+        """output_uri_prefix_mode=None => no outputUriPrefixMode key in the API params."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, output_uri_prefix_mode=None)
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        call_kwargs = mock_client.start_run.call_args.kwargs
+        assert 'outputUriPrefixMode' not in call_kwargs
+        assert result['outputUriPrefixMode'] == 'SERVICE_DEFINED'
+
+    @pytest.mark.asyncio
+    async def test_start_run_omits_output_uri_prefix_mode_when_unresolved_field(self):
+        """An unresolved Field default is treated as omitted, not forwarded or rejected."""
+        from pydantic import Field
+
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, output_uri_prefix_mode=Field(None))
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert 'outputUriPrefixMode' not in mock_client.start_run.call_args.kwargs
+        assert result['outputUriPrefixMode'] == 'SERVICE_DEFINED'
+
+    @pytest.mark.parametrize('mode', ['SERVICE_DEFINED', 'NONE_WITH_OVERWRITE'])
+    @pytest.mark.asyncio
+    async def test_start_run_forwards_valid_output_uri_prefix_mode(self, mode):
+        """Each valid value is forwarded to the API and reflected in the response."""
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        result = await self._call(mock_client, output_uri_prefix_mode=mode)
+
+        assert 'error' not in result, f'Unexpected error for mode={mode!r}: {result}'
+        mock_client.start_run.assert_called_once()
+        assert mock_client.start_run.call_args.kwargs['outputUriPrefixMode'] == mode
+        assert result['outputUriPrefixMode'] == mode
+
+    @pytest.mark.parametrize('mode', ['INVALID', 'none_with_overwrite', '', 'NONE'])
+    @pytest.mark.asyncio
+    async def test_start_run_invalid_output_uri_prefix_mode_returns_error(self, mode):
+        """An invalid value returns a validation error naming it and never calls the API."""
+        mock_client = MagicMock()
+
+        result = await self._call(mock_client, output_uri_prefix_mode=mode)
+
+        assert 'error' in result
+        assert f"'{mode}'" in result['error']
+        assert 'NONE_WITH_OVERWRITE' in result['error']
+        assert result['error'].count('Invalid output URI prefix mode') == 1
+        mock_client.start_run.assert_not_called()
+
+    def test_start_run_output_uri_prefix_mode_description_documents_overwrite(self):
+        """The parameter description names both values and the overwrite risk."""
+        field_info = (
+            _inspect.signature(_workflow_execution.start_run)
+            .parameters['output_uri_prefix_mode']
+            .default
+        )
+        description = field_info.description
+
+        assert field_info.default is None
+        assert 'SERVICE_DEFINED' in description
+        assert 'NONE_WITH_OVERWRITE' in description
+        assert 'overwrites' in description
+        assert 'unique output_uri per run' in description
+
+    @pytest.mark.asyncio
+    async def test_start_run_params_validate_against_botocore_model(self):
+        """The forwarded params, including outputUriPrefixMode, satisfy the real StartRun shape."""
+        import botocore.session
+        from botocore.validate import ParamValidator
+
+        mock_client = MagicMock()
+        mock_client.start_run.return_value = dict(self._api_response)
+
+        await self._call(mock_client, output_uri_prefix_mode='NONE_WITH_OVERWRITE')
+
+        input_shape = (
+            botocore.session.get_session()
+            .get_service_model('omics')
+            .operation_model('StartRun')
+            .input_shape
+        )
+        # requestId is an idempotency token that boto3 auto-populates on real clients
+        params = {'requestId': 'test-token', **mock_client.start_run.call_args.kwargs}
+        report = ParamValidator().validate(params, input_shape)
+        assert not report.has_errors(), report.generate_report()
+
+    @pytest.mark.parametrize('mode', ['SERVICE_DEFINED', 'NONE_WITH_OVERWRITE'])
+    @pytest.mark.asyncio
+    async def test_get_run_surfaces_output_uri_prefix_mode(self, mode):
+        """get_run includes outputUriPrefixMode unchanged when the API returns it."""
+        mock_client = MagicMock()
+        mock_client.get_run.return_value = {
+            'id': 'run-12345',
+            'status': 'RUNNING',
+            'outputUriPrefixMode': mode,
+        }
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await get_run(AsyncMock(), run_id='run-12345')
+
+        assert result['outputUriPrefixMode'] == mode
+
+    @pytest.mark.asyncio
+    async def test_get_run_omits_output_uri_prefix_mode_when_absent(self):
+        """get_run omits outputUriPrefixMode when the API response does not contain it."""
+        mock_client = MagicMock()
+        mock_client.get_run.return_value = {'id': 'run-12345', 'status': 'RUNNING'}
+
+        with patch(
+            'awslabs.aws_healthomics_mcp_server.tools.workflow_execution.get_omics_client',
+            return_value=mock_client,
+        ):
+            result = await get_run(AsyncMock(), run_id='run-12345')
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert 'outputUriPrefixMode' not in result

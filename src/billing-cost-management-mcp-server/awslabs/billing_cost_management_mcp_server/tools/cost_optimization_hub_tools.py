@@ -17,25 +17,402 @@
 Updated to use shared utility functions.
 """
 
+import botocore.session
+import json
 from ..utilities.aws_service_base import (
     create_aws_client,
     format_response,
+    get_date_range,
     handle_aws_error,
     parse_json,
 )
 from ..utilities.constants import (
+    COST_OPTIMIZATION_HUB_LIST_EFFICIENCY_METRICS_VALID_ORDER_DIMENSIONS,
+    COST_OPTIMIZATION_HUB_LIST_RECOMMENDATIONS_VALID_ORDER_DIMENSIONS,
+    COST_OPTIMIZATION_HUB_SERVICE_NAME,
     COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES,
+    EFFICIENCY_METRICS_MAX_DAILY_SPAN_DAYS,
+    EFFICIENCY_METRICS_MAX_MONTHLY_SPAN_MONTHS,
+    EFFICIENCY_METRICS_VALID_GRANULARITY,
+    EFFICIENCY_METRICS_VALID_GROUP_BY_VALUES,
+    EFFICIENCY_METRICS_VALID_RANKING_MODES,
+    EFFICIENCY_RANKING_MODE_PERFORMANCE,
+    GRANULARITY_DAILY,
+    GRANULARITY_MONTHLY,
+    GROUP_BY_TAG_KEY_PREFIX,
+    OPERATION_GET_PREFERENCES,
     OPERATION_GET_RECOMMENDATION,
+    OPERATION_LIST_EFFICIENCY_METRICS,
+    OPERATION_LIST_ENROLLMENT_STATUSES,
     OPERATION_LIST_RECOMMENDATION_SUMMARIES,
     OPERATION_LIST_RECOMMENDATIONS,
+    ORDER_BY_VALID_ORDERS,
+    PAGINATION_LIMIT_TEXT,
 )
 from .cost_optimization_hub_helpers import (
+    get_preferences,
     get_recommendation,
+    list_efficiency_metrics,
+    list_enrollment_statuses,
     list_recommendation_summaries,
     list_recommendations,
 )
+from datetime import date, datetime, timedelta
 from fastmcp import Context, FastMCP
-from typing import Any, Dict, Optional
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _is_valid_efficiency_date(date_str: Optional[str], granularity: str) -> bool:
+    """Validate an efficiency-metrics date against the format its granularity requires.
+
+    ``ListEfficiencyMetrics`` uses ``YYYY-MM-DD`` for Daily and ``YYYY-MM`` for
+    Monthly. The date is validated against the *resolved* granularity rather than
+    accepting the two formats interchangeably, so a granularity/format mismatch
+    (e.g. Daily + ``2026-06``) is rejected locally with a clear message instead
+    of being forwarded to the API as a malformed date.
+    """
+    if not date_str:
+        return False
+    fmt = '%Y-%m-%d' if granularity == GRANULARITY_DAILY else '%Y-%m'
+    try:
+        parsed = datetime.strptime(date_str, fmt)
+    except ValueError:
+        return False
+    return parsed.strftime(fmt) == date_str
+
+
+def _coerce_date_for_granularity(date_str: str, granularity: str) -> str:
+    """Coerce a date to the format the requested granularity expects.
+
+    Monthly metrics use ``YYYY-MM``; truncate a ``YYYY-MM-DD`` value (e.g. from
+    ``get_date_range``) to its month. Daily metrics keep the full date.
+    """
+    if granularity == GRANULARITY_MONTHLY:
+        return date_str[:7]
+    return date_str
+
+
+def _today() -> date:
+    """Current date, matching get_date_range's clock so default windows never clamp.
+
+    Isolated in one function so tests can pin 'now' when exercising the clamp.
+    """
+    return datetime.now().date()
+
+
+def _clamp_daily(start_date: str, end_date: str) -> str:
+    """Move a Daily start forward into the last-90-days window the API serves.
+
+    COH rejects a start more than 90 days before today (the limit is start-to-now,
+    not the requested span). Returns the start unchanged when it is already within
+    range, or when the whole window predates the range (nothing to salvage, so let
+    the service reject it); otherwise returns today minus 90 days.
+    """
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d').date()
+    earliest = _today() - timedelta(days=EFFICIENCY_METRICS_MAX_DAILY_SPAN_DAYS)
+    if start_dt >= earliest or earliest >= end_dt:
+        return start_date
+    return earliest.strftime('%Y-%m-%d')
+
+
+def _clamp_monthly(start_date: str, end_date: str) -> str:
+    """Move a Monthly start forward into the last-3-months window the API serves.
+
+    COH rejects a start more than 3 months before the current month (the limit is
+    start-to-now, not the requested span). Returns the start unchanged when it is
+    already within range, or when the whole window predates the range (nothing to
+    salvage, so let the service reject it); otherwise returns the earliest month.
+    """
+    start_dt = datetime.strptime(start_date, '%Y-%m')
+    end_dt = datetime.strptime(end_date, '%Y-%m')
+    today = _today()
+    now_months = today.year * 12 + today.month
+    start_months = start_dt.year * 12 + start_dt.month
+    end_months = end_dt.year * 12 + end_dt.month
+    earliest_months = now_months - EFFICIENCY_METRICS_MAX_MONTHLY_SPAN_MONTHS
+    if start_months >= earliest_months or earliest_months >= end_months:
+        return start_date
+    year = (earliest_months - 1) // 12
+    month = earliest_months - year * 12
+    return f'{year:04d}-{month:02d}'
+
+
+def _clamp_efficiency_time_span(start_date: str, end_date: str, granularity: str) -> str:
+    """Move start_date forward into the lookback the COH API will serve.
+
+    ``ListEfficiencyMetrics`` only serves data whose ``start`` is within the most
+    recent 90 days (Daily) or 3 months (Monthly) of today -- the limit is measured
+    from ``start`` to *now*, not the requested span -- and rejects an older start
+    with a ``ValidationException``. Rather than surface that as an error, move
+    ``start_date`` forward to the start of the available window (today minus the
+    cap). The return value is the effective start; when it differs from the
+    requested one the window was trimmed, which is reflected in the response's
+    ``time_period`` / ``operation_parameters`` so the caller can explain it to
+    the user.
+
+    Dates are assumed pre-coerced to the granularity's format (``YYYY-MM-DD`` for
+    Daily, ``YYYY-MM`` for Monthly) by ``_coerce_date_for_granularity``. An
+    unparseable date is passed through untouched (validation happens upstream).
+    """
+    try:
+        if granularity == GRANULARITY_DAILY:
+            return _clamp_daily(start_date, end_date)
+        if granularity == GRANULARITY_MONTHLY:
+            return _clamp_monthly(start_date, end_date)
+    except ValueError:
+        # Malformed dates are rejected upstream by _is_valid_efficiency_date;
+        # if one slips through, pass it to the API unchanged.
+        pass
+    return start_date
+
+
+def _error_response(
+    operation: str, data: Any, message: str, error_type: str = 'validation_error'
+) -> Dict[str, Any]:
+    """Build a local (pre-API) validation error response.
+
+    Adds top-level ``service``, ``operation``, and ``error_type`` so the failure
+    is classifiable, matching the shape ``handle_aws_error`` returns for AWS
+    errors. The legacy ``status``/``data``/``message`` payload is preserved for
+    backward compatibility.
+    """
+    return format_response(
+        'error',
+        data,
+        message,
+        error_type=error_type,
+        operation=operation,
+        service=COST_OPTIMIZATION_HUB_SERVICE_NAME,
+    )
+
+
+def _filter_key(value: str) -> str:
+    """Fold a filter key or value for matching: case- and underscore-insensitive."""
+    return value.casefold().replace('_', '')
+
+
+@lru_cache(maxsize=1)
+def _filter_members() -> Dict[str, Any]:
+    """Return {filter key: botocore shape} for every member of the API's Filter.
+
+    Read offline from the installed botocore service model. Returns an empty map if
+    the model cannot be loaded (normalization is then skipped).
+    """
+    try:
+        service_model: Any = botocore.session.get_session().get_service_model(
+            'cost-optimization-hub'
+        )
+        return dict(service_model.shape_for('Filter').members)
+    except Exception:
+        return {}
+
+
+def _filter_model() -> Dict[str, Optional[List[str]]]:
+    """Return {filter key: enum values, or None} for the list-valued filter keys."""
+    return {
+        name: (list(shape.member.enum) if getattr(shape.member, 'enum', None) else None)
+        for name, shape in _filter_members().items()
+        if shape.type_name == 'list'
+    }
+
+
+def _filter_item_fields() -> Dict[str, List[str]]:
+    """Return {filter key: field names} for list filters whose items are objects (tags)."""
+    return {
+        name: list(shape.member.members)
+        for name, shape in _filter_members().items()
+        if shape.type_name == 'list' and shape.member.type_name == 'structure'
+    }
+
+
+# The service rejects each of these on ListRecommendationSummaries with a ValidationException
+# ("Cannot include recommendationId|resourceId|resourceArn as a filter for this operation"),
+# so they are refused locally with a hint instead of costing a call.
+SUMMARIES_UNSUPPORTED_FILTERS = frozenset({'recommendationIds', 'resourceIds', 'resourceArns'})
+
+
+def _decodes_to_object(text: str) -> bool:
+    """Whether text is itself a JSON object, as a double-encoded filters value is."""
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:
+        return False
+
+
+def _normalize_filters(operation: str, filters: Any) -> Tuple[Any, Optional[Dict[str, Any]]]:
+    """Fold filter keys and enum values onto the spelling the API expects.
+
+    The API is case-sensitive on both. Keys match case-, underscore-, and
+    singular/plural-insensitively (``ResourceType`` -> ``resourceTypes``); enum values
+    match case- and underscore-insensitively (``ec2_instance`` -> ``Ec2Instance``). A
+    single bare value is wrapped in a list, and a ``"true"``/``"false"`` string for a
+    boolean filter becomes a boolean (botocore rejects the string). Values that match
+    nothing are passed through unchanged, so the service stays the authority on what is
+    valid.
+
+    Returns:
+        (normalized filters, None), or (original filters, error response) when filters is
+        not a JSON object or a list filter is empty, which the API rejects.
+    """
+    if filters is not None and not isinstance(filters, dict):
+        message = 'filters must be a JSON object, e.g. {"resourceTypes": ["Ec2Instance"]}'
+        if isinstance(filters, str) and _decodes_to_object(filters):
+            message += '; it was JSON-encoded twice, so encode the object once'
+        return filters, _error_response(operation, {'provided_filters': filters}, message + '.')
+    model = _filter_model()
+    if filters is None or not model:
+        return filters, None
+
+    members = _filter_members()
+    keys = {_filter_key(name).removesuffix('s'): name for name in members}
+    normalized: Dict[str, Any] = {}
+    for key, value in filters.items():
+        name = keys.get(_filter_key(key).removesuffix('s'), key) if isinstance(key, str) else key
+        if (
+            name in members
+            and members[name].type_name == 'boolean'
+            and isinstance(value, str)
+            and value.strip().casefold() in ('true', 'false')
+        ):
+            value = value.strip().casefold() == 'true'
+        if name in model:
+            if isinstance(value, (str, dict)):
+                value = [value]
+            enum = model[name]
+            if enum and isinstance(value, list):
+                canonical = {_filter_key(v): v for v in enum}
+                value = [
+                    canonical.get(_filter_key(v), v) if isinstance(v, str) else v for v in value
+                ]
+            fields = {_filter_key(f): f for f in _filter_item_fields().get(name, [])}
+            if fields and isinstance(value, list):
+                # Fold item field names (Key/Value -> key/value); tag keys and values
+                # themselves are case-sensitive and kept as given.
+                value = [
+                    {
+                        (fields.get(_filter_key(k), k) if isinstance(k, str) else k): v
+                        for k, v in item.items()
+                    }
+                    if isinstance(item, dict)
+                    else item
+                    for item in value
+                ]
+        normalized[name] = value
+
+    empty = [name for name, value in normalized.items() if name in model and value == []]
+    if empty:
+        return filters, _error_response(
+            operation,
+            {
+                'submitted_filters': filters,
+                'empty_filters': empty,
+                'valid_filter_values': {name: model[name] for name in empty if model[name]},
+            },
+            f'Filter {", ".join(empty)} is empty; omit it to include all values, '
+            'or pass one or more values.',
+        )
+    return normalized, None
+
+
+def _summaries_valid_group_by() -> List[str]:
+    """Return the group_by values list_recommendation_summaries accepts, for error messages."""
+    return [*COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES, f'{GROUP_BY_TAG_KEY_PREFIX}<tag key>']
+
+
+def _resolve_summaries_group_by(group_by: Any) -> Tuple[Any, Optional[Dict[str, Any]]]:
+    """Validate list_recommendation_summaries group_by, accepting 'TagKey:<tag key>'.
+
+    The API is case-sensitive. Fixed dimensions and the 'TagKey:' prefix match
+    case-insensitively and are sent in the API's spelling (``resourcetype`` ->
+    ``ResourceType``). Underscores are not ignored, so ``RESOURCE_TYPE`` is rejected. The
+    tag key itself is case-sensitive and kept as given.
+
+    Returns:
+        (group_by to send, None), or (None, error response).
+    """
+    valid = _summaries_valid_group_by()
+    if isinstance(group_by, str) and group_by.casefold().startswith(
+        GROUP_BY_TAG_KEY_PREFIX.casefold()
+    ):
+        tag_key = group_by[len(GROUP_BY_TAG_KEY_PREFIX) :]
+        if not tag_key.strip():
+            return None, _error_response(
+                OPERATION_LIST_RECOMMENDATION_SUMMARIES,
+                {'provided_group_by': group_by, 'valid_group_by_values': valid},
+                f'group_by {group_by} needs a tag key, e.g. {GROUP_BY_TAG_KEY_PREFIX}Environment.',
+            )
+        return GROUP_BY_TAG_KEY_PREFIX + tag_key, None
+    canonical = {v.casefold(): v for v in COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES}
+    resolved = canonical.get(group_by.casefold()) if isinstance(group_by, str) else None
+    if resolved is None:
+        return None, _error_response(
+            OPERATION_LIST_RECOMMENDATION_SUMMARIES,
+            {'provided_group_by': group_by, 'valid_group_by_values': valid},
+            f'Invalid group_by value: {group_by}. Must be one of: {", ".join(valid)}.',
+        )
+    return resolved, None
+
+
+def _add_valid_filter_values(result: Dict[str, Any], filters: Any) -> Dict[str, Any]:
+    """On a ValidationException, attach the accepted values of the enum filters sent.
+
+    The API's error message does not say which filter failed, so this gives the caller
+    the values to choose from.
+    """
+    if result.get('error_type') != 'ValidationException' or not isinstance(filters, dict):
+        return result
+    model = _filter_model()
+    valid = {name: model[name] for name in filters if model.get(name)}
+    if valid:
+        result['valid_filter_values'] = valid
+    return result
+
+
+def _validate_order_by(
+    order_by: Any, valid_dimensions: list, operation: str
+) -> Optional[Dict[str, Any]]:
+    """Validate a parsed ``order_by`` structure against the supported dimensions.
+
+    Returns an ``_error_response(...)`` dict when the structure is
+    invalid, or ``None`` when it is acceptable. ``order`` (``Asc``/``Desc``) is
+    optional; when present it must be a valid order value.
+    """
+    if not isinstance(order_by, dict):
+        return _error_response(
+            operation,
+            {'provided_order_by': order_by},
+            'order_by must be a JSON object like {"dimension": ..., "order": "Asc"|"Desc"}.',
+        )
+    dimension = order_by.get('dimension')
+    order = order_by.get('order')
+    if dimension not in valid_dimensions:
+        return _error_response(
+            operation,
+            {'provided_dimension': dimension, 'valid_dimensions': valid_dimensions},
+            f'Invalid order_by dimension: {dimension}. Must be one of: {", ".join(valid_dimensions)}.',
+        )
+    if order is not None and order not in ORDER_BY_VALID_ORDERS:
+        return _error_response(
+            operation,
+            {'provided_order': order, 'valid_orders': ORDER_BY_VALID_ORDERS},
+            f'Invalid order_by order: {order}. Must be one of: {", ".join(ORDER_BY_VALID_ORDERS)}.',
+        )
+    return None
+
+
+DEDUPLICATION_NOTE_DEFAULT = (
+    'Cost Optimization Hub returned its deduplicated view: one action per resource and one '
+    'Savings Plans/Reserved Instances purchase option per covered usage, chosen first by the '
+    "account's commitment preference (term and payment option), then by savings. Alternatives "
+    'are hidden; call again with include_all_recommendations=true to compare purchase options.'
+)
+DEDUPLICATION_NOTE_ALL = (
+    'Includes alternatives for the same resource or the same usage. Alternatives are '
+    'mutually exclusive, so do not add their estimated savings together. For a '
+    'deduplicated total, use list_recommendation_summaries.'
+)
 
 
 cost_optimization_hub_server = FastMCP(
@@ -46,47 +423,177 @@ cost_optimization_hub_server = FastMCP(
 
 @cost_optimization_hub_server.tool(
     name='cost-optimization',
-    description="""Retrieves cost optimization recommendations from AWS Cost Optimization Hub.
+    description="""Cost savings recommendations across services from AWS Cost Optimization Hub, including idle and unused resources (stop or delete), rightsizing, Graviton migration, and Savings Plans and Reserved Instances purchases.
+For performance-based recommendations, use compute-optimizer. For one recommendation, use this tool's get_recommendation operation; use rec-details only when Compute Optimizer or Cost Explorer enrichment is wanted.
 
 IMPORTANT USAGE GUIDELINES:
-- Focus on recommendations with the highest estimated savings first
+- Focus on recommendations with the highest estimated savings first; when presenting only some, state how many were omitted and their combined savings
 - Include all relevant details when presenting specific recommendations
-
-USE THIS TOOL FOR:
-- **Idle/unused resource detection** (EC2, RDS, EBS, Lambda, etc.)
-- **Cost savings recommendations** (rightsizing, stopping, deleting resources)
-- **Reserved Instance and Savings Plans purchase recommendations**
-- **Cross-service cost optimization analysis**
-- **Monthly cost reduction opportunities**
-
-DO NOT USE FOR: Performance optimization (use compute-optimizer)
 
 Supported Operations:
 1. list_recommendation_summaries: High-level overview of savings opportunities grouped by a dimension
 2. list_recommendations: Detailed list of specific recommendations
 3. get_recommendation: Get detailed information about a specific recommendation
+4. list_efficiency_metrics: Cost efficiency score, estimated savings, and spend as
+   a time series (optionally grouped by AccountId or Region). Use for questions
+   about the cost-efficiency score, how it changed over time (use 'Daily' for
+   that), cross-region/cross-account comparison, and top/worst performers. Each
+   point is a one-day snapshot, not a period total: the estimated savings of the
+   recommendations open on that day, against the trailing 30 days of spend.
+5. list_enrollment_statuses: Cost Optimization Hub enrollment status (Active/Inactive)
+   of the calling account. Optional 'account_id' returns the status of that account instead.
+   An account that has never enrolled has no enrollment record; it is reported as
+   'Inactive'. On Inactive, do not call the recommendation or
+   efficiency-metrics operations, which would only fail with "AWS account is not
+   enrolled for recommendations."
+6. get_preferences: Cost Optimization Hub preferences of the calling account: savings
+   estimation mode, member account discount visibility, and preferred commitment term
+   and payment option for Savings Plans/RI recommendations. Params: (none)
 
 IMPORTANT: 'list_recommendation_summaries' operation REQUIRES a 'group_by' parameter.
 Valid 'group_by' values: AccountId, Region, ActionType, ResourceType, RestartNeeded, RollbackPossible, ImplementationEffort
+(matched case-insensitively). Or group by a tag's values with
+'TagKey:<tag key>' (e.g. 'TagKey:Environment'). The tag
+key is case-sensitive; recommendations without the tag, or for a key that does not exist,
+are grouped under 'NoTagKey'.
+
+list_recommendation_summaries also returns metrics.savings_percentage: the estimated
+deduplicated monthly savings as a percent of the last 30 days' net amortized cost,
+excluding credits and refunds, for the whole filtered result (not per group). It is a
+whole-number string such as '12%', clamped to '>=80%' and '<=2%'. It is only computed when
+the savings estimation mode preference is AfterDiscounts and the only filters are
+accountIds, regions and tags; otherwise metrics.savings_percentage_unavailable_reason gives
+the service's reason instead. The metrics block can be absent.
+
+SAVINGS TOTALS:
+- For a portfolio total, use list_recommendation_summaries estimated_total_deduped_savings
+  with no filter, or with only accountIds and/or regions. Never add up list_recommendations
+  estimated_monthly_savings: items overlap (commitment purchases and rightsizing or idle
+  actions on the same usage, Auto Scaling groups and their instances, Payer and Linked copies).
+- Filters other than accountIds and regions (actionTypes, resourceTypes, implementationEfforts,
+  restartNeeded, rollbackPossible) change how overlap is netted out, so a filtered total is
+  not that slice's share of the portfolio total, and filtered totals do not sum to it.
+- Commitment (Savings Plans/Reserved Instance) savings assume current usage; implementing
+  rightsizing or idle recommendations reduces them.
+- With include_all_recommendations=true, the same purchase appears once per term, payment
+  option, and Payer/Linked scope, so a sum is inflated further.
 
 CRITICAL PARAMETER REQUIREMENTS:
 - 'filters' parameter must be passed as JSON string format
-- 'max_results' must be integer (not string)
-- 'get_recommendation' requires both 'resource_id' AND 'resource_type' parameters
+- 'max_items' must be integer (not string)
+
+PAGINATION (list_recommendations, list_recommendation_summaries, list_efficiency_metrics):
+- 'max_items' is the total number of items returned. If it is omitted, the tool fetches every page for """
+    + PAGINATION_LIMIT_TEXT
+    + """, then returns a partial result. Pass it, or narrow 'filters', for queries that can be large (e.g. list_recommendations across an organization).
+- Top N: pass 'order_by' with max_items=N (list_recommendations, list_efficiency_metrics). Without order_by, the first N are not the top N.
+- If the result has complete_dataset: false, it is partial: totals and counts undercount. Call again with a larger 'max_items', continue with 'next_token', or state that the result is partial. Never report the number of returned items as a total count.
+- Summary fields (estimated_total_deduped_savings, currency_code, metrics) cover the whole filtered result and are the same on every page, including continuation calls: do not add them across pages (total_recommendation_count is different; see the next bullet).
+- list_recommendation_summaries returns total_recommendation_count (the sum of the groups' recommendation_count) only when every group was fetched; use it as the overall count instead of adding the groups. It is absent on a partial result, a continuation call, or when a group has no recommendation_count.
+- list_recommendation_summaries returns at most 1,000 groups, those with the highest estimated savings, and no next_token for the rest, so a larger 'max_items' or a continuation cannot fetch them. A result of 1,000 groups is marked complete_dataset: false: groups (e.g. accounts) may be missing and estimated_total_deduped_savings may cover only the returned groups. For totals, group by a dimension with fewer values (such as Region). A continuation call cannot see earlier pages, so its last page is not marked: when paging with 'max_items', 1,000 groups across all pages means the same.
+- In ranking_mode='performance', 'max_items' only limits how many ranked groups are returned; the fetch behind the ranking is fixed. A ranking has no 'next_token'; a larger 'max_items' or a continuation does not widen it. complete_dataset: false there means only the top spenders were fetched and ranked: group_by=Region (fewer groups) for a complete ranking, or state that it covers only the top spenders. If 'ranking_mode' is omitted, the tool returns the raw per-group series without ranking.
+- list_enrollment_statuses, get_recommendation and get_preferences are not paginated.
+- 'get_recommendation' requires only 'recommendation_id' (mapped to the API's recommendationId)
 - Service only available in us-east-1 region
 
+list_efficiency_metrics parameters:
+- 'granularity': 'Daily' or 'Monthly' (defaults to 'Monthly' when omitted).
+  A Monthly point ('YYYY-MM') is not a monthly average or total: it is the
+  snapshot for the last day of the month that has data, with the trailing 30
+  days of spend at month-end, so a change on that one day moves the month's
+  value. Ask only for completed months (end_date no later than the current
+  month, since end is exclusive); a current-month point would be partial. For a
+  trend or a change over time, use 'Daily' and read the daily series rather than
+  comparing Monthly values. When reporting a Monthly value, say it is the
+  month-end snapshot.
+- 'start_date' / 'end_date': window bounds as 'YYYY-MM-DD' (daily) or 'YYYY-MM'
+  (monthly); end is exclusive. Both default to a ~90-day lookback when omitted.
+  The API only serves data whose start is within the most recent 90 days (Daily)
+  or 3 months (Monthly) of today; an older start_date is automatically moved
+  forward to that window, so the returned time_period/start_date may be later
+  than requested.
+- 'group_by' (optional): 'AccountId' or 'Region' only. Omit to aggregate across all.
+- 'order_by' (optional): JSON string {"dimension": "Score"|"Savings"|"Spend",
+  "order": "Asc"|"Desc"} for top/worst-performer and directional-sort questions.
+- Does NOT accept 'filters'.
+
+Sorting: 'order_by' (JSON string {"dimension": ..., "order": "Asc"|"Desc"}) is also
+accepted by 'list_recommendations'. Valid dimensions: EstimatedMonthlySavings,
+EstimatedMonthlyCost, RestartNeeded, ImplementationEffort, AccountId, RollbackPossible,
+Region, ResourceType, ActionType, ResourceArn, ResourceId, EstimatedSavingsPercentage.
+('list_recommendation_summaries' does not support order_by.)
+
+Deduplication (list_recommendations, 'include_all_recommendations'):
+- By default (false or omitted) Cost Optimization Hub deduplicates what it returns.
+  For each resource it keeps one action, the one with the highest estimated savings.
+  For Savings Plans and Reserved Instances (discounts for a 1- or 3-year commitment
+  to a set spend or usage) it keeps one recommended purchase option per covered usage
+  and hides the alternatives. The option kept is the one closest to the account's
+  commitment preference (term and payment option, see get_preferences), then the one
+  with the highest savings, so a hidden term or payment option can save more. For
+  example, unless 'filters' rule them out, it shows Compute Savings Plans and hides
+  EC2 Instance Savings Plans and EC2 Reserved Instances. In a management (payer) account it keeps the
+  organization-wide options (summary ends "(Payer account level)") and hides the
+  options sized for one account ("(Linked account level)"). Filter 'accountIds' to
+  member accounts, without the management account, to see those for member
+  accounts; include_all_recommendations=true lists all of them. The sp-recommendation
+  tool returns Cost Explorer's recommendations for each Savings Plans type.
+- Which option is kept depends on 'filters': filtering resourceTypes to options the
+  default hid (e.g. ["Ec2ReservedInstances"]) returns those, still deduplicated
+  among the filtered types. It does not mean they save more than the option the
+  default kept.
+- Set include_all_recommendations=true to compare purchase options or to list every
+  action for a resource. That list includes alternatives for the same resource or the
+  same usage; alternatives are mutually exclusive, so do not add their estimated
+  savings together. For a deduplicated total, use list_recommendation_summaries.
+- list_recommendation_summaries always deduplicates and does not take
+  include_all_recommendations. It uses its own rules (it lowers Savings Plans/RI
+  savings by what rightsizing or removing the covered resources would already save),
+  so its per-type counts and savings need not match list_recommendations.
+
 Available Filter Parameters (pass as JSON string):
-- resourceTypes: ['Ec2Instance', 'LambdaFunction', 'EbsVolume', 'EcsService', 'Ec2AutoScalingGroup', 'Ec2InstanceSavingsPlans', 'ComputeSavingsPlans', 'SageMakerSavingsPlans', 'Ec2ReservedInstances', 'RdsReservedInstances', 'OpenSearchReservedInstances', 'RedshiftReservedInstances', 'ElastiCacheReservedInstances', 'RdsDbInstanceStorage', 'RdsDbInstance', 'DynamoDbReservedCapacity', 'MemoryDbReservedInstances']
+- resourceTypes: ['Ec2Instance', 'LambdaFunction', 'EbsVolume', 'EcsService', 'Ec2AutoScalingGroup', 'Ec2InstanceSavingsPlans', 'ComputeSavingsPlans', 'SageMakerSavingsPlans', 'Ec2ReservedInstances', 'RdsReservedInstances', 'OpenSearchReservedInstances', 'RedshiftReservedInstances', 'ElastiCacheReservedInstances', 'RdsDbInstanceStorage', 'RdsDbInstance', 'AuroraDbClusterStorage', 'DynamoDbReservedCapacity', 'MemoryDbReservedInstances', 'NatGateway', 'DynamoDBTable', 'ElastiCacheCluster', 'MemoryDBCluster', 'DocumentDBCluster', 'WorkSpaces', 'SageMakerEndpoint']
+  For Database Savings Plans purchase recommendations, use sp-recommendation with
+  savings_plans_type DATABASE_SP. One rejected value fails the whole request. For a value
+  that matches no documented type (case and underscores aside, see below), the error's
+  'fields' lists every type in the service's model, including types the account cannot
+  use; choose from valid_filter_values (the documented types).
+  The service can return types not listed here; list_recommendations shows them. There is
+  no per-service filter: to cover a service, list each of its types (e.g. RDS:
+  'RdsDbInstance', 'RdsDbInstanceStorage', 'AuroraDbClusterStorage',
+  'RdsReservedInstances').
 - actionTypes: ['Rightsize', 'Stop', 'Upgrade', 'PurchaseSavingsPlans', 'PurchaseReservedInstances', 'MigrateToGraviton', 'Delete', 'ScaleIn']
 - implementationEfforts: ['VeryLow', 'Low', 'Medium', 'High', 'VeryHigh']
-- regions: AWS region codes (e.g., ["us-east-1", "us-west-2"])
+- regions: AWS region codes (e.g., ["us-east-1", "us-west-2"]).
+  Savings Plans recommendations are reported differently by each operation.
+  list_recommendations reports them with the region "Global", so a region code such as
+  "us-east-1" drops every Savings Plans recommendation and regions=["Global"] returns them.
+  list_recommendation_summaries attributes their savings to the regions where the usage ran,
+  so "us-east-1" returns them and "Global" returns $0. The same region filter can therefore
+  show no Savings Plans in the list and a positive amount in the summaries.
 - accountIds: List of AWS account IDs
-- restartNeeded: boolean
-- rollbackPossible: boolean
+- restartNeeded: true or false (the strings "true"/"false" are accepted too)
+- tags: List of {"key": ..., "value": ...} objects, e.g.
+  [{"key": "Environment", "value": "prod"}, {"key": "Environment", "value": "staging"},
+  {"key": "Team", "value": "web"}] matches (Environment=prod OR staging) AND Team=web.
+  Values for the same key are ORed; different keys are ANDed. Both key and value are
+  required and matched exactly (case-sensitive, no wildcards). Only tags that appear on
+  the recommendations can match (see 'tags' in get_recommendation).
+- rollbackPossible: true or false (the strings "true"/"false" are accepted too)
+- resourceIds, resourceArns, recommendationIds: lists of resource IDs, resource ARNs or
+  recommendation IDs. list_recommendations only; list_recommendation_summaries rejects
+  them locally.
+Filter keys and enum values are matched case- and underscore-insensitively
+(e.g. "ec2_instance" -> "Ec2Instance"); tag keys and values are not. List filters must be non-empty: omit a filter
+to include all values rather than passing []. An empty list is rejected locally, and a
+rejected value returns the accepted values in valid_filter_values.
 
 Cost Optimization Hub provides recommendations across multiple AWS services, including:
 - EC2 instances (right-sizing, Graviton migration)
-- EBS volumes (unused volumes, IOPS optimization)
+- EBS volumes (Delete covers both idle attached volumes and unattached ones: a
+  recommended_resource_summary starting "Detach volume from instance" marks an attached
+  volume, and get_recommendation returns attachment_state "Attached" or "Unattached" as of
+  last_refresh_timestamp), IOPS/type optimization
 - RDS instances (right-sizing, engine optimization)
 - Lambda functions (memory size optimization)
 - SP/RI
@@ -102,31 +609,77 @@ Each recommendation includes:
 async def cost_optimization_hub(
     ctx: Context,
     operation: str,
-    resource_id: Optional[str] = None,
-    resource_type: Optional[str] = None,
-    max_results: Optional[int] = None,
+    recommendation_id: Optional[str] = None,
+    max_items: Optional[int] = None,
     filters: Optional[str] = None,
     group_by: Optional[str] = None,
     include_all_recommendations: Optional[bool] = None,
+    next_token: Optional[str] = None,
+    granularity: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    order_by: Optional[str] = None,
+    ranking_mode: Optional[str] = None,
+    account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Retrieves recommendations from AWS Cost Optimization Hub.
+    """Retrieves recommendations and efficiency metrics from AWS Cost Optimization Hub.
 
     Args:
         ctx: The MCP context
-        operation: The operation to perform ('list_recommendations', 'get_recommendation', or 'list_recommendation_summaries')
-        resource_id: Resource ID for get_recommendation operation
-        resource_type: Resource type for get_recommendation operation
-        max_results: Maximum total results to return across all pages; None means all available results
-        filters: Optional filter expression as JSON string
-        group_by: Optional grouping parameter for list_recommendation_summaries
-        include_all_recommendations: Whether to include all recommendations
+        operation: The operation to perform ('list_recommendations', 'get_recommendation', 'list_recommendation_summaries', 'list_efficiency_metrics', 'list_enrollment_statuses', or 'get_preferences')
+        recommendation_id: Recommendation ID for get_recommendation operation (mapped to the API's recommendationId)
+        max_items: Total items to return for list_recommendations,
+            list_recommendation_summaries and list_efficiency_metrics. Omit to fetch every
+            page. In ranking_mode='performance', the most ranked groups to return.
+        filters: Optional filter expression as JSON string (not supported by list_efficiency_metrics).
+            Scope to accounts with accountIds, e.g. '{"accountIds": ["123456789012"]}'
+        group_by: Optional grouping parameter. For list_recommendation_summaries any
+            of the recommendation dimensions, or 'TagKey:<tag key>'; for
+            list_efficiency_metrics only AccountId or Region.
+        include_all_recommendations: For list_recommendations only. False or
+            omitted (default): one deduplicated recommendation per resource, and
+            one Savings Plans/Reserved Instances purchase option per covered usage,
+            chosen first by the account's commitment preference; Cost Optimization Hub
+            hides the alternatives. True: every recommendation, including one row per
+            term, payment option, and Payer/Linked scope for the same purchase, so do
+            not sum their estimated_monthly_savings to get a total.
+        next_token: Pagination token to resume from a previous response.
+            Applies to list_recommendations, list_recommendation_summaries, and
+            list_efficiency_metrics.
+        granularity: Time granularity for list_efficiency_metrics ('Daily' or
+            'Monthly'). Defaults to 'Monthly' when omitted. A Monthly point is the
+            month-end snapshot (the last day of the month that has data), not a
+            monthly average; use 'Daily' for trends.
+        start_date: Inclusive window start for list_efficiency_metrics
+            ('YYYY-MM-DD' or 'YYYY-MM'). Defaults to a ~90-day lookback when omitted.
+        end_date: Exclusive window end for list_efficiency_metrics ('YYYY-MM-DD'
+            or 'YYYY-MM'). Defaults to today when omitted.
+        order_by: Optional ordering as JSON string ``{"dimension": ..., "order":
+            "Asc"|"Desc"}``. For list_efficiency_metrics the dimension is one of
+            Score/Savings/Spend; also accepted by list_recommendations. In
+            ranking_mode='performance' order_by does NOT drive the fetch — only its
+            ``order`` picks the ranking direction (Score Asc = worst/lowest first,
+            Score Desc or omitted = best/top first).
+        ranking_mode: For list_efficiency_metrics only. Set to 'performance' for a
+            "most efficient / top / worst performer" ranking of accounts or Regions.
+            The tool fetches the highest-spend accounts first (orderBy Spend Desc)
+            up to a page cap, drops idle/no-score groups, then: if the FULL set was
+            retrieved, keeps the highest-spend groups making up ~80% of total spend
+            (Pareto) and ranks them by score; if the fetch hit the cap, skips the
+            spend cutoff and ranks the fetched top spenders by score, flagging in
+            ranking_focus that only the top ~N spenders were analyzed (see console
+            for the rest). Ranking direction comes from order_by (see above).
+            Requires group_by=AccountId or Region. Omit for the raw per-group series
+            (e.g. a plain trend or single-account score).
+        account_id: For list_enrollment_statuses only. Optional account ID whose
+            enrollment status to return. Omit for the calling account.
 
     Returns:
         Dict containing the Cost Optimization Hub recommendations
 
     Note:
-        This function automatically fetches all pages of results and combines them into
-        a single response when multiple pages are available.
+        The paginated operations fetch every page unless ``max_items`` is passed, and
+        report ``complete_dataset``/``has_more``/``next_token`` in the ``pagination`` block.
     """
     try:
         # Log the request
@@ -139,29 +692,23 @@ async def cost_optimization_hub(
         # Validate operation-specific requirements
         if operation == OPERATION_LIST_RECOMMENDATION_SUMMARIES:
             if not group_by:
-                return format_response(
-                    'error',
-                    {'valid_group_by_values': COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES},
-                    'group_by parameter is required for list_recommendation_summaries operation. Must be one of: ACCOUNT_ID, RECOMMENDATION_TYPE, RESOURCE_TYPE, TAG, USAGE_TYPE',
+                valid_group_by = _summaries_valid_group_by()
+                return _error_response(
+                    operation,
+                    {'valid_group_by_values': valid_group_by},
+                    f'group_by parameter is required for list_recommendation_summaries operation. Must be one of: {", ".join(valid_group_by)}.',
                 )
 
-            # Validate the group_by value is one of the allowed values
-            if group_by not in COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES:
-                return format_response(
-                    'error',
-                    {
-                        'provided_group_by': group_by,
-                        'valid_group_by_values': COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES,
-                    },
-                    f'Invalid group_by value: {group_by}. Must be one of: {", ".join(COST_OPTIMIZATION_HUB_VALID_GROUP_BY_VALUES)}',
-                )
+            group_by, group_by_error = _resolve_summaries_group_by(group_by)
+            if group_by_error:
+                return group_by_error
 
         elif operation == OPERATION_GET_RECOMMENDATION:
-            if not resource_id or not resource_type:
-                return format_response(
-                    'error',
+            if not recommendation_id:
+                return _error_response(
+                    operation,
                     {},
-                    'Both resource_id and resource_type are required for get_recommendation operation',
+                    'recommendation_id is required for get_recommendation operation',
                 )
 
         # Execute the appropriate operation
@@ -169,104 +716,286 @@ async def cost_optimization_hub(
             try:
                 # Parse filters if provided
                 parsed_filters = parse_json(filters, 'filters') if filters else None
+                parsed_filters, filter_error = _normalize_filters(operation, parsed_filters)
+                if filter_error:
+                    return filter_error
+                id_filters = (
+                    sorted(set(parsed_filters) & SUMMARIES_UNSUPPORTED_FILTERS)
+                    if isinstance(parsed_filters, dict)
+                    else []
+                )
+                if id_filters:
+                    return _error_response(
+                        operation,
+                        {
+                            'submitted_filters': filters,
+                            'unsupported_filters': id_filters,
+                            'supported_filters': sorted(
+                                set(_filter_members()) - SUMMARIES_UNSUPPORTED_FILTERS
+                            ),
+                        },
+                        f'Filter {", ".join(id_filters)} is not supported by '
+                        'list_recommendation_summaries. Use one of supported_filters.',
+                    )
 
-                effective_group_by = str(group_by) if group_by else 'RESOURCE_TYPE'
+                # group_by was validated and resolved to the API's spelling above.
+                effective_group_by = str(group_by)
                 await ctx.info(f'Using group_by: {effective_group_by}')
 
                 result = await list_recommendation_summaries(
                     ctx,
                     coh_client,
                     group_by=effective_group_by,
-                    max_results=int(max_results) if max_results else None,
+                    max_items=max_items,
                     filters=parsed_filters,
+                    next_token=next_token,
                 )
+
+                result = _add_valid_filter_values(result, parsed_filters)
 
                 # Add the operation parameters to the response for diagnostics
                 if result.get('status') == 'success' and isinstance(result.get('data'), dict):
                     result['data']['operation_parameters'] = {
                         'group_by': effective_group_by,
-                        'max_results': max_results,
+                        'max_items': max_items,
                         'filters': filters,
+                        'next_token': next_token,
                     }
 
                 return result
 
             except Exception as recommendation_error:
-                await ctx.error(
-                    f'Error in list_recommendation_summaries: {str(recommendation_error)}'
-                )
-
-                # Create a detailed error response
-                return format_response(
-                    'error',
-                    {
-                        'error_type': 'service_error',
-                        'service': 'Cost Optimization Hub',
-                        'operation': 'list_recommendation_summaries',
-                        'message': str(recommendation_error),
-                        'group_by': group_by or 'RESOURCE_TYPE',
-                    },
-                    'Error fetching recommendation summaries from Cost Optimization Hub.',
+                return await handle_aws_error(
+                    ctx,
+                    recommendation_error,
+                    OPERATION_LIST_RECOMMENDATION_SUMMARIES,
+                    COST_OPTIMIZATION_HUB_SERVICE_NAME,
                 )
 
         elif operation == OPERATION_LIST_RECOMMENDATIONS:
             try:
                 # Parse filters if provided
                 parsed_filters = parse_json(filters, 'filters') if filters else None
+                parsed_filters, filter_error = _normalize_filters(operation, parsed_filters)
+                if filter_error:
+                    return filter_error
+                parsed_order_by = parse_json(order_by, 'order_by') if order_by else None
+                if parsed_order_by is not None:
+                    order_by_error = _validate_order_by(
+                        parsed_order_by,
+                        COST_OPTIMIZATION_HUB_LIST_RECOMMENDATIONS_VALID_ORDER_DIMENSIONS,
+                        operation,
+                    )
+                    if order_by_error:
+                        return order_by_error
 
                 result = await list_recommendations(
-                    ctx, coh_client, max_results, parsed_filters, include_all_recommendations
+                    ctx,
+                    coh_client,
+                    max_items,
+                    parsed_filters,
+                    include_all_recommendations,
+                    next_token=next_token,
+                    order_by=parsed_order_by,
+                )
+
+                result = _add_valid_filter_values(result, parsed_filters)
+
+                # Add the operation parameters to the response for diagnostics
+                if result.get('status') == 'success' and isinstance(result.get('data'), dict):
+                    result['data']['operation_parameters'] = {
+                        'max_items': max_items,
+                        'filters': filters,
+                        'include_all_recommendations': include_all_recommendations,
+                        'next_token': next_token,
+                        'order_by': order_by,
+                    }
+                    result['data']['deduplication_note'] = (
+                        DEDUPLICATION_NOTE_ALL
+                        if include_all_recommendations
+                        else DEDUPLICATION_NOTE_DEFAULT
+                    )
+
+                return result
+
+            except Exception as recommendation_error:
+                return await handle_aws_error(
+                    ctx,
+                    recommendation_error,
+                    OPERATION_LIST_RECOMMENDATIONS,
+                    COST_OPTIMIZATION_HUB_SERVICE_NAME,
+                )
+
+        elif operation == OPERATION_GET_RECOMMENDATION:
+            # recommendation_id is already validated above
+            return await get_recommendation(ctx, coh_client, str(recommendation_id))
+
+        elif operation == OPERATION_LIST_EFFICIENCY_METRICS:
+            try:
+                effective_granularity = granularity or GRANULARITY_MONTHLY
+                if effective_granularity not in EFFICIENCY_METRICS_VALID_GRANULARITY:
+                    return _error_response(
+                        operation,
+                        {
+                            'provided_granularity': granularity,
+                            'valid_granularity_values': EFFICIENCY_METRICS_VALID_GRANULARITY,
+                        },
+                        f'Invalid granularity: {granularity}. Must be one of: {", ".join(EFFICIENCY_METRICS_VALID_GRANULARITY)}.',
+                    )
+
+                # Efficiency metrics only group by AccountId/Region (no per-service score).
+                if group_by and group_by not in EFFICIENCY_METRICS_VALID_GROUP_BY_VALUES:
+                    return _error_response(
+                        operation,
+                        {
+                            'provided_group_by': group_by,
+                            'valid_group_by_values': EFFICIENCY_METRICS_VALID_GROUP_BY_VALUES,
+                        },
+                        f'Invalid group_by for list_efficiency_metrics: {group_by}. Must be one of: {", ".join(EFFICIENCY_METRICS_VALID_GROUP_BY_VALUES)}.',
+                    )
+
+                # Time window: default a ~90-day lookback when dates are omitted
+                # (mirrors the Cost Explorer date-defaulting pattern).
+                default_start, default_end = get_date_range(
+                    start_date, end_date, default_days_ago=90
+                )
+                effective_start = start_date or default_start
+                effective_end = end_date or default_end
+
+                # Coerce to the format the granularity expects (Monthly ->
+                # YYYY-MM, truncating any day component), THEN validate each date
+                # against that resolved-granularity format. Validating after
+                # coercion — instead of accepting YYYY-MM and YYYY-MM-DD
+                # interchangeably — rejects a granularity/format mismatch (e.g.
+                # Daily + '2026-06') locally with a clear message rather than
+                # forwarding a malformed date to the API.
+                effective_start = _coerce_date_for_granularity(
+                    effective_start, effective_granularity
+                )
+                effective_end = _coerce_date_for_granularity(effective_end, effective_granularity)
+
+                expected_format = (
+                    'YYYY-MM-DD' if effective_granularity == GRANULARITY_DAILY else 'YYYY-MM'
+                )
+                for label, value in (
+                    ('start_date', effective_start),
+                    ('end_date', effective_end),
+                ):
+                    if not _is_valid_efficiency_date(value, effective_granularity):
+                        return _error_response(
+                            operation,
+                            {label: value, 'granularity': effective_granularity},
+                            f'Invalid {label}: {value}. For {effective_granularity} '
+                            f'granularity use {expected_format}.',
+                        )
+
+                # Move an over-old start forward into the window the API serves
+                # (start within the last 90 days Daily / 3 months Monthly)
+                # instead of letting COH reject the call with a ValidationException.
+                # The effective (moved-forward) start is surfaced via
+                # operation_parameters below so the caller can explain any
+                # trimming to the user.
+                effective_start = _clamp_efficiency_time_span(
+                    effective_start, effective_end, effective_granularity
+                )
+
+                # Parse and validate order_by (JSON string -> dict), mirroring filters.
+                parsed_order_by = parse_json(order_by, 'order_by') if order_by else None
+                if parsed_order_by is not None:
+                    order_by_error = _validate_order_by(
+                        parsed_order_by,
+                        COST_OPTIMIZATION_HUB_LIST_EFFICIENCY_METRICS_VALID_ORDER_DIMENSIONS,
+                        operation,
+                    )
+                    if order_by_error:
+                        return order_by_error
+
+                # Validate ranking_mode; 'performance' (Pareto materiality) needs a
+                # grouping dimension to rank, so require group_by when it is set.
+                if ranking_mode is not None:
+                    if ranking_mode not in EFFICIENCY_METRICS_VALID_RANKING_MODES:
+                        return _error_response(
+                            operation,
+                            {
+                                'provided_ranking_mode': ranking_mode,
+                                'valid_ranking_modes': EFFICIENCY_METRICS_VALID_RANKING_MODES,
+                            },
+                            f'Invalid ranking_mode: {ranking_mode}. Must be one of: '
+                            f'{", ".join(EFFICIENCY_METRICS_VALID_RANKING_MODES)}.',
+                        )
+                    if ranking_mode == EFFICIENCY_RANKING_MODE_PERFORMANCE and not group_by:
+                        return _error_response(
+                            operation,
+                            {'ranking_mode': ranking_mode, 'group_by': group_by},
+                            "ranking_mode='performance' requires group_by=AccountId or "
+                            'Region (there is nothing to rank without a grouping dimension).',
+                        )
+
+                await ctx.info(
+                    f'Fetching efficiency metrics: granularity={effective_granularity}, '
+                    f'window={effective_start}..{effective_end}, group_by={group_by}, '
+                    f'ranking_mode={ranking_mode}'
+                )
+
+                result = await list_efficiency_metrics(
+                    ctx,
+                    coh_client,
+                    granularity=effective_granularity,
+                    start_date=effective_start,
+                    end_date=effective_end,
+                    group_by=group_by,
+                    order_by=parsed_order_by,
+                    max_items=max_items,
+                    next_token=next_token,
+                    ranking_mode=ranking_mode,
                 )
 
                 # Add the operation parameters to the response for diagnostics
                 if result.get('status') == 'success' and isinstance(result.get('data'), dict):
                     result['data']['operation_parameters'] = {
-                        'max_results': max_results,
-                        'filters': filters,
-                        'include_all_recommendations': include_all_recommendations,
+                        'granularity': effective_granularity,
+                        'start_date': effective_start,
+                        'end_date': effective_end,
+                        'group_by': group_by,
+                        'order_by': order_by,
+                        'max_items': max_items,
+                        'next_token': next_token,
+                        'ranking_mode': ranking_mode,
                     }
 
                 return result
 
-            except Exception as recommendation_error:
-                await ctx.error(f'Error in list_recommendations: {str(recommendation_error)}')
-
-                # Create a detailed error response
-                return format_response(
-                    'error',
-                    {
-                        'error_type': 'service_error',
-                        'service': 'Cost Optimization Hub',
-                        'operation': 'list_recommendations',
-                        'message': str(recommendation_error),
-                    },
-                    'Error fetching recommendations from Cost Optimization Hub.',
+            except Exception as efficiency_error:
+                return await handle_aws_error(
+                    ctx,
+                    efficiency_error,
+                    OPERATION_LIST_EFFICIENCY_METRICS,
+                    COST_OPTIMIZATION_HUB_SERVICE_NAME,
                 )
 
-        elif operation == OPERATION_GET_RECOMMENDATION:
-            if not resource_id or not resource_type:
-                return format_response(
-                    'error',
-                    {
-                        'message': 'Both resource_id and resource_type are required for get_recommendation operation'
-                    },
-                )
-            return await get_recommendation(ctx, coh_client, str(resource_id), str(resource_type))
+        elif operation == OPERATION_LIST_ENROLLMENT_STATUSES:
+            return await list_enrollment_statuses(ctx, coh_client, account_id=account_id)
+
+        elif operation == OPERATION_GET_PREFERENCES:
+            return await get_preferences(ctx, coh_client)
 
         else:
             # Return error for unsupported operations
-            return format_response(
-                'error',
+            return _error_response(
+                operation,
                 {
                     'supported_operations': [
                         OPERATION_LIST_RECOMMENDATION_SUMMARIES,
                         OPERATION_LIST_RECOMMENDATIONS,
                         OPERATION_GET_RECOMMENDATION,
+                        OPERATION_LIST_EFFICIENCY_METRICS,
+                        OPERATION_LIST_ENROLLMENT_STATUSES,
+                        OPERATION_GET_PREFERENCES,
                     ]
                 },
-                f"Unsupported operation: {operation}. Use '{OPERATION_LIST_RECOMMENDATION_SUMMARIES}', '{OPERATION_LIST_RECOMMENDATIONS}', or '{OPERATION_GET_RECOMMENDATION}'.",
+                f"Unsupported operation: {operation}. Use '{OPERATION_LIST_RECOMMENDATION_SUMMARIES}', '{OPERATION_LIST_RECOMMENDATIONS}', '{OPERATION_GET_RECOMMENDATION}', '{OPERATION_LIST_EFFICIENCY_METRICS}', '{OPERATION_LIST_ENROLLMENT_STATUSES}', or '{OPERATION_GET_PREFERENCES}'.",
+                error_type='invalid_operation',
             )
 
     except Exception as e:
-        await ctx.error(f'Error in Cost Optimization Hub operation {operation}: {str(e)}')
-        return await handle_aws_error(ctx, e, operation, 'Cost Optimization Hub')
+        return await handle_aws_error(ctx, e, operation, COST_OPTIMIZATION_HUB_SERVICE_NAME)

@@ -199,6 +199,91 @@ class TestErrorMessages:
         # ERROR_STATIC_STORAGE_REQUIRES_CAPACITY doesn't have placeholders
 
 
+class TestScratchStorageModes:
+    """Test cases for scratch storage mode constants.
+
+    Feature: local-temp-storage
+    Validates: Requirements MCP server defaults to LOCAL scratch storage,
+    Validation of the scratch storage mode value
+    """
+
+    def test_scratch_storage_mode_constants(self):
+        """Test individual scratch storage mode constants."""
+        assert consts.SCRATCH_STORAGE_MODE_LOCAL == 'LOCAL'
+        assert consts.SCRATCH_STORAGE_MODE_SHARED == 'SHARED'
+
+    def test_scratch_storage_modes_list(self):
+        """Test SCRATCH_STORAGE_MODES contains exactly LOCAL and SHARED in order."""
+        assert consts.SCRATCH_STORAGE_MODES == ['LOCAL', 'SHARED']
+        assert consts.SCRATCH_STORAGE_MODE_LOCAL in consts.SCRATCH_STORAGE_MODES
+        assert consts.SCRATCH_STORAGE_MODE_SHARED in consts.SCRATCH_STORAGE_MODES
+        assert len(consts.SCRATCH_STORAGE_MODES) == 2
+
+    def test_default_scratch_storage_mode_is_local(self):
+        """Test the MCP server default scratch storage mode is LOCAL."""
+        assert consts.DEFAULT_SCRATCH_STORAGE_MODE == 'LOCAL'
+        assert consts.DEFAULT_SCRATCH_STORAGE_MODE in consts.SCRATCH_STORAGE_MODES
+
+
+class TestScratchStorageErrorTemplate:
+    """Test cases for the invalid scratch storage mode error template.
+
+    Feature: local-temp-storage
+    Validates: Requirements Validation of the scratch storage mode value
+    """
+
+    def test_error_template_has_two_placeholders(self):
+        """Test the template exposes placeholders for the value and allowed list."""
+        assert isinstance(consts.ERROR_INVALID_SCRATCH_STORAGE_MODE, str)
+        # Two positional placeholders: rejected value and allowed-values list.
+        assert consts.ERROR_INVALID_SCRATCH_STORAGE_MODE.count('{}') == 2
+
+    def test_error_template_includes_rejected_value_and_allowed_list(self):
+        """Test the formatted message names the rejected value and the allowed list."""
+        rejected = 'local'
+        message = consts.ERROR_INVALID_SCRATCH_STORAGE_MODE.format(
+            rejected, consts.SCRATCH_STORAGE_MODES
+        )
+
+        # The rejected value appears in the message.
+        assert rejected in message
+        # The complete list of allowed values appears in the message.
+        assert str(consts.SCRATCH_STORAGE_MODES) in message
+        assert 'LOCAL' in message
+        assert 'SHARED' in message
+
+
+class TestRunLogLevelConstants:
+    """Test cases for run log level constants.
+
+    Feature: run-log-level
+    Validates: Exposing and validating the run logLevel value
+    """
+
+    def test_run_log_level_constants(self):
+        """Test individual run log level constants."""
+        assert consts.RUN_LOG_LEVEL_OFF == 'OFF'
+        assert consts.RUN_LOG_LEVEL_FATAL == 'FATAL'
+        assert consts.RUN_LOG_LEVEL_ERROR == 'ERROR'
+        assert consts.RUN_LOG_LEVEL_ALL == 'ALL'
+
+    def test_run_log_levels_list(self):
+        """Test RUN_LOG_LEVELS contains exactly the four levels in order."""
+        assert consts.RUN_LOG_LEVELS == ['OFF', 'FATAL', 'ERROR', 'ALL']
+        assert consts.RUN_LOG_LEVEL_OFF in consts.RUN_LOG_LEVELS
+        assert consts.RUN_LOG_LEVEL_FATAL in consts.RUN_LOG_LEVELS
+        assert consts.RUN_LOG_LEVEL_ERROR in consts.RUN_LOG_LEVELS
+        assert consts.RUN_LOG_LEVEL_ALL in consts.RUN_LOG_LEVELS
+        assert len(consts.RUN_LOG_LEVELS) == 4
+
+    def test_invalid_run_log_level_error_template(self):
+        """Test the error template exposes a placeholder for the allowed list."""
+        assert isinstance(consts.ERROR_INVALID_RUN_LOG_LEVEL, str)
+        assert consts.ERROR_INVALID_RUN_LOG_LEVEL.count('{}') == 1
+        message = consts.ERROR_INVALID_RUN_LOG_LEVEL.format(consts.RUN_LOG_LEVELS)
+        assert str(consts.RUN_LOG_LEVELS) in message
+
+
 class TestConstantsIntegration:
     """Integration tests for constants."""
 
@@ -230,3 +315,17 @@ class TestConstantsIntegration:
     def test_default_region_in_supported_regions(self):
         """Test that DEFAULT_REGION is included in HEALTHOMICS_SUPPORTED_REGIONS."""
         assert consts.DEFAULT_REGION in consts.HEALTHOMICS_SUPPORTED_REGIONS
+
+
+class TestOutputUriPrefixModes:
+    """Test cases for the run output URI prefix mode constants and error template."""
+
+    def test_output_uri_prefix_modes_list(self):
+        """Test OUTPUT_URI_PREFIX_MODES contains exactly the two API values in order."""
+        assert consts.OUTPUT_URI_PREFIX_MODE_SERVICE_DEFINED == 'SERVICE_DEFINED'
+        assert consts.OUTPUT_URI_PREFIX_MODE_NONE_WITH_OVERWRITE == 'NONE_WITH_OVERWRITE'
+        assert consts.OUTPUT_URI_PREFIX_MODES == ['SERVICE_DEFINED', 'NONE_WITH_OVERWRITE']
+
+    def test_error_template_has_two_placeholders(self):
+        """Test the template exposes placeholders for the value and allowed list."""
+        assert consts.ERROR_INVALID_OUTPUT_URI_PREFIX_MODE.count('{}') == 2

@@ -39,7 +39,7 @@ This project is a server that dynamically creates Model Context Protocol (MCP) t
 
 | Kiro | Cursor | VS Code |
 |:----:|:------:|:-------:|
-| [![Add to Kiro](https://kiro.dev/images/add-to-kiro.svg)](https://kiro.dev/launch/mcp/add?name=awslabs.openapi-mcp-server&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22awslabs.openapi-mcp-server%40latest%22%5D%2C%22env%22%3A%7B%22API_NAME%22%3A%22your-api-name%22%2C%22API_BASE_URL%22%3A%22https%3A//api.example.com%22%2C%22API_SPEC_URL%22%3A%22https%3A//api.example.com/openapi.json%22%2C%22LOG_LEVEL%22%3A%22ERROR%22%2C%22ENABLE_PROMETHEUS%22%3A%22false%22%2C%22ENABLE_OPERATION_PROMPTS%22%3A%22true%22%2C%22UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN%22%3A%225.0%22%2C%22UVICORN_GRACEFUL_SHUTDOWN%22%3A%22true%22%7D%7D) | [![Install MCP Server](https://cursor.com/deeplink/mcp-install-light.svg)](https://cursor.com/en/install-mcp?name=awslabs.openapi-mcp-server&config=eyJjb21tYW5kIjoidXZ4IGF3c2xhYnMub3BlbmFwaS1tY3Atc2VydmVyQGxhdGVzdCIsImVudiI6eyJBUElfTkFNRSI6InlvdXItYXBpLW5hbWUiLCJBUElfQkFTRV9VUkwiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbSIsIkFQSV9TUEVDX1VSTCI6Imh0dHBzOi8vYXBpLmV4YW1wbGUuY29tL29wZW5hcGkuanNvbiIsIkxPR19MRVZFTCI6IkVSUk9SIiwiRU5BQkxFX1BST01FVEhFVVMiOiJmYWxzZSIsIkVOQUJMRV9PUEVSQVRJT05fUFJPTVBUUyI6InRydWUiLCJVVklDT1JOX1RJTUVPVVRfR1JBQ0VGVUxfU0hVVERPV04iOiI1LjAiLCJVVklDT1JOX0dSQUNFRlVMX1NIVVRET1dOIjoidHJ1ZSJ9LCJkaXNhYmxlZCI6ZmFsc2UsImF1dG9BcHByb3ZlIjpbXX0%3D) | [![Install on VS Code](https://img.shields.io/badge/Install_on-VS_Code-FF9900?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=OpenAPI%20MCP%20Server&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22awslabs.openapi-mcp-server%40latest%22%5D%2C%22env%22%3A%7B%22API_NAME%22%3A%22your-api-name%22%2C%22API_BASE_URL%22%3A%22https%3A%2F%2Fapi.example.com%22%2C%22API_SPEC_URL%22%3A%22https%3A%2F%2Fapi.example.com%2Fopenapi.json%22%2C%22LOG_LEVEL%22%3A%22ERROR%22%2C%22ENABLE_PROMETHEUS%22%3A%22false%22%2C%22ENABLE_OPERATION_PROMPTS%22%3A%22true%22%2C%22UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN%22%3A%225.0%22%2C%22UVICORN_GRACEFUL_SHUTDOWN%22%3A%22true%22%7D%2C%22disabled%22%3Afalse%2C%22autoApprove%22%3A%5B%5D%7D) |
+| [![Add to Kiro](https://kiro.dev/images/add-to-kiro.svg)](https://kiro.dev/launch/mcp/add?name=awslabs.openapi-mcp-server&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22awslabs.openapi-mcp-server%40latest%22%5D%2C%22env%22%3A%7B%22API_NAME%22%3A%22your-api-name%22%2C%22API_BASE_URL%22%3A%22https%3A//api.example.com%22%2C%22API_SPEC_URL%22%3A%22https%3A//api.example.com/openapi.json%22%2C%22LOG_LEVEL%22%3A%22ERROR%22%2C%22ENABLE_PROMETHEUS%22%3A%22false%22%2C%22ENABLE_OPERATION_PROMPTS%22%3A%22true%22%7D%7D) | [![Install MCP Server](https://cursor.com/deeplink/mcp-install-light.svg)](https://cursor.com/en/install-mcp?name=awslabs.openapi-mcp-server&config=eyJjb21tYW5kIjoidXZ4IGF3c2xhYnMub3BlbmFwaS1tY3Atc2VydmVyQGxhdGVzdCIsImVudiI6eyJBUElfTkFNRSI6InlvdXItYXBpLW5hbWUiLCJBUElfQkFTRV9VUkwiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbSIsIkFQSV9TUEVDX1VSTCI6Imh0dHBzOi8vYXBpLmV4YW1wbGUuY29tL29wZW5hcGkuanNvbiIsIkxPR19MRVZFTCI6IkVSUk9SIiwiRU5BQkxFX1BST01FVEhFVVMiOiJmYWxzZSIsIkVOQUJMRV9PUEVSQVRJT05fUFJPTVBUUyI6InRydWUifSwiZGlzYWJsZWQiOmZhbHNlLCJhdXRvQXBwcm92ZSI6W119) | [![Install on VS Code](https://img.shields.io/badge/Install_on-VS_Code-FF9900?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=OpenAPI%20MCP%20Server&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22awslabs.openapi-mcp-server%40latest%22%5D%2C%22env%22%3A%7B%22API_NAME%22%3A%22your-api-name%22%2C%22API_BASE_URL%22%3A%22https%3A%2F%2Fapi.example.com%22%2C%22API_SPEC_URL%22%3A%22https%3A%2F%2Fapi.example.com%2Fopenapi.json%22%2C%22LOG_LEVEL%22%3A%22ERROR%22%2C%22ENABLE_PROMETHEUS%22%3A%22false%22%2C%22ENABLE_OPERATION_PROMPTS%22%3A%22true%22%7D%2C%22disabled%22%3Afalse%2C%22autoApprove%22%3A%5B%5D%7D) |
 
 ### From PyPI
 
@@ -89,9 +89,7 @@ Example configuration for Kiro (`~/.kiro/settings/mcp.json`):
           "API_SPEC_URL": "https://api.example.com/openapi.json",
           "LOG_LEVEL": "ERROR",
           "ENABLE_PROMETHEUS": "false",
-          "ENABLE_OPERATION_PROMPTS": "true",
-          "UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN": "5.0",
-          "UVICORN_GRACEFUL_SHUTDOWN": "true"
+          "ENABLE_OPERATION_PROMPTS": "true"
       },
       "disabled": false,
       "autoApprove": []
@@ -125,10 +123,8 @@ For Windows users, the MCP server configuration format is slightly different:
           "API_SPEC_URL": "https://api.example.com/openapi.json",
           "LOG_LEVEL": "ERROR",
           "ENABLE_PROMETHEUS": "false",
-          "ENABLE_OPERATION_PROMPTS": "true",
-          "UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN": "5.0",
-          "UVICORN_GRACEFUL_SHUTDOWN": "true"
-      },
+          "ENABLE_OPERATION_PROMPTS": "true"
+      }
     }
   }
 }
@@ -247,11 +243,6 @@ uvx --refresh --from . awslabs.openapi-mcp-server --api-url https://petstore3.sw
 
 ```bash
 # Server configuration
-export SERVER_NAME="My API Server"
-export SERVER_DEBUG=true
-export SERVER_MESSAGE_TIMEOUT=60
-export SERVER_HOST="0.0.0.0"
-export SERVER_PORT=8000
 export SERVER_TRANSPORT="stdio"  # Option: stdio
 export LOG_LEVEL="INFO"  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
 
@@ -259,10 +250,6 @@ export LOG_LEVEL="INFO"  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
 export ENABLE_PROMETHEUS="false"  # Enable/disable Prometheus metrics (default: false)
 export PROMETHEUS_PORT=9090  # Port for Prometheus metrics server
 export ENABLE_OPERATION_PROMPTS="true"  # Enable/disable operation-specific prompts (default: true)
-
-# Graceful shutdown configuration
-export UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=5.0  # Timeout for graceful shutdown in seconds
-export UVICORN_GRACEFUL_SHUTDOWN=true  # Enable/disable graceful shutdown
 
 # API configuration
 export API_NAME="myapi"
@@ -329,17 +316,19 @@ The server validates all URLs in `additional_specs` entries before fetching:
 
 **Credential isolation**: Additional specs never inherit the primary API's credentials. Each entry must declare its own `auth_type`/`auth_token` or defaults to no auth.
 
+**DNS pinning (rebinding protection)**: Spec URLs are validated **and fetched against the same resolved IP** — the loader connects only to the address(es) that passed validation, never re-resolving the hostname at fetch time. This closes the DNS-rebinding TOCTOU window where a hostname could resolve to a public IP during validation and to an internal/metadata IP during the fetch. This applies to both the primary spec URL and every `additional_specs` entry. Redirects are not followed (a `30x` toward an internal host is rejected), and spec bodies are capped at 10 MiB.
+
+**Reference (`$ref`) resolution**: Only internal, in-document references (`#/components/...`) are resolved. External references — remote `http(s)://`/`file://` targets, or relative multi-file references such as `schemas.yaml#/Pet` — are refused before parsing, so a hostile spec cannot use a `$ref` to reach internal services, cloud metadata, or local files (SSRF/LFI). Split multi-file specs must be bundled into a single document before loading.
+
 **Path traversal protection**: `spec_path` is canonicalized, restricted to spec file extensions (`.json`, `.yaml`, `.yml`), and checked against a best-effort system directory blocklist. For production deployments, use `--allowed-spec-dirs` to explicitly restrict allowed paths.
 
 **Escape hatches** for development/internal use:
 
 | Flag | Env Var | Effect |
 |------|---------|--------|
-| `--allow-insecure-http` | `ALLOW_INSECURE_HTTP=true` | Permits `http://` URLs |
+| `--allow-insecure-http` | `ALLOW_INSECURE_HTTP=true` | Permits `http://` URLs (still DNS-pinned) |
 | `--allow-private-networks` | `ALLOW_PRIVATE_NETWORKS=true` | Permits private/loopback IPs |
 | `--allowed-spec-dirs` | `ALLOWED_SPEC_DIRS=/path1:/path2` | Restricts `spec_path` to listed directories |
-
-> **Note**: DNS validation confirms hostnames resolve to public IPs at check time. For environments requiring full DNS pinning, deploy behind an egress proxy or use `spec_path` with local files.
 
 To report security issues, see the [Contributing Guidelines](https://github.com/awslabs/mcp/blob/main/CONTRIBUTING.md#security-issue-notifications).
 
@@ -352,18 +341,16 @@ The project includes a Dockerfile for containerized deployment. To build and run
 docker build -t openapi-mcp-server:latest .
 
 # Run with default settings
-docker run -p 8000:8000 openapi-mcp-server:latest
+docker run -i openapi-mcp-server:latest
 
 # Run with custom configuration
-docker run -p 8000:8000 \
+docker run -i \
   -e API_NAME=myapi \
   -e API_BASE_URL=https://api.example.com \
   -e API_SPEC_URL=https://api.example.com/openapi.json \
   -e SERVER_TRANSPORT=stdio \
   -e ENABLE_PROMETHEUS=false \
   -e ENABLE_OPERATION_PROMPTS=true \
-  -e UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=5.0 \
-  -e UVICORN_GRACEFUL_SHUTDOWN=true \
   openapi-mcp-server:latest
 ```
 
@@ -457,8 +444,6 @@ To test the OpenAPI MCP Server with Kiro, you need to configure Kiro to use your
            "LOG_LEVEL": "INFO",
            "ENABLE_PROMETHEUS": "false",
            "ENABLE_OPERATION_PROMPTS": "true",
-           "UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN": "5.0",
-           "UVICORN_GRACEFUL_SHUTDOWN": "true",
            "PYTHONPATH": "/path/to/your/openapi-mcp-server"
          },
          "disabled": false,

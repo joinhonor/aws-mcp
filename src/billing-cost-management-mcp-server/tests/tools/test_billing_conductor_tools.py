@@ -19,32 +19,12 @@ billing groups, account associations, cost reports, pricing rules/plans,
 and custom line items.
 """
 
+import asyncio
 import fastmcp
 import importlib
 import pytest
 from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
     billing_conductor_server,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    get_billing_group_cost_report as get_billing_group_cost_report_tool,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    list_account_associations as list_account_associations_tool,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    list_billing_group_cost_reports as list_billing_group_cost_reports_tool,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    list_billing_groups as list_billing_groups_tool,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    list_custom_line_items as list_custom_line_items_tool,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    list_pricing_plans as list_pricing_plans_tool,
-)
-from awslabs.billing_cost_management_mcp_server.tools.billing_conductor_tools import (
-    list_pricing_rules as list_pricing_rules_tool,
 )
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -71,6 +51,19 @@ PATCH_LIST_ACCOUNT_ASSOCIATIONS_OP = (
     'awslabs.billing_cost_management_mcp_server.tools.'
     'billing_conductor_tools._list_account_associations'
 )
+
+
+@pytest.fixture(scope='module', autouse=True)
+def _restore_real_tool_module():
+    """Reload the module with the real FastMCP.tool after this file's tests.
+
+    _reload_bc_with_identity_decorator() leaves the module's server with no registered tools;
+    restoring it keeps later test files from seeing that state.
+    """
+    yield
+    from awslabs.billing_cost_management_mcp_server.tools import billing_conductor_tools as module
+
+    importlib.reload(module)
 
 
 def _reload_bc_with_identity_decorator():
@@ -121,44 +114,136 @@ def test_billing_conductor_server_initialization():
 
 def test_list_billing_groups_tool_registered():
     """Test that the list_billing_groups tool is registered with proper name."""
-    assert hasattr(list_billing_groups_tool, 'name')
-    assert list_billing_groups_tool.name == 'list-billing-groups'
+    tool = asyncio.run(billing_conductor_server.get_tool('list-billing-groups'))
+    assert tool is not None
+    assert tool.name == 'list-billing-groups'
 
 
 def test_list_account_associations_tool_registered():
     """Test that the list_account_associations tool is registered with proper name."""
-    assert hasattr(list_account_associations_tool, 'name')
-    assert list_account_associations_tool.name == 'list-account-associations'
+    tool = asyncio.run(billing_conductor_server.get_tool('list-account-associations'))
+    assert tool is not None
+    assert tool.name == 'list-account-associations'
+
+
+def _description(tool_name):
+    tool = asyncio.run(billing_conductor_server.get_tool(tool_name))
+    assert tool is not None
+    return ' '.join((tool.description or '').split())
+
+
+def test_list_billing_groups_describes_filter_limits():
+    """Names takes one case-sensitive prefix, Statuses at most 2, PricingPlan a full ARN."""
+    description = _description('list-billing-groups')
+    assert 'Names: exactly one name search, a case-sensitive prefix match' in description
+    assert 'Statuses: at most 2 of ACTIVE, PRIMARY_ACCOUNT_MISSING, PENDING' in description
+    assert 'PricingPlan: a full pricing plan ARN' in description
+    assert 'supports STARTS_WITH search' not in description
+    assert 'validation_error' not in description
+
+
+def test_list_account_associations_describes_filter_rules():
+    """AccountId and AccountIds exclude each other, and Association takes a full ARN."""
+    description = _description('list-account-associations')
+    assert 'Use AccountId or AccountIds, not both' in description
+    assert 'A full billing group ARN' in description
+    assert 'MONITORED and UNMONITORED are upper case' in description
+    assert 'bare billing group ID' not in description
+    assert 'validation_error' not in description
+
+
+def test_get_billing_group_cost_report_describes_period_defaults():
+    """No range means the current month to date; the end is exclusive; months sum without BILLING_PERIOD."""
+    description = _description('get-billing-group-cost-report')
+    assert 'Without it, the report covers only the current month, month-to-date' in description
+    assert 'The end month is excluded' in description
+    assert 'Include BILLING_PERIOD in GroupBy to get one row per month' in description
+    assert 'the months of a range are summed' in description
+    assert 'BILLING_PERIOD: "2025-01"' in description
+    assert 'Nov 2023' not in description
 
 
 def test_list_billing_group_cost_reports_tool_registered():
     """Test that the list_billing_group_cost_reports tool is registered."""
-    assert hasattr(list_billing_group_cost_reports_tool, 'name')
-    assert list_billing_group_cost_reports_tool.name == 'list-billing-group-cost-reports'
+    tool = asyncio.run(billing_conductor_server.get_tool('list-billing-group-cost-reports'))
+    assert tool is not None
+    assert tool.name == 'list-billing-group-cost-reports'
 
 
 def test_get_billing_group_cost_report_tool_registered():
     """Test that the get_billing_group_cost_report tool is registered."""
-    assert hasattr(get_billing_group_cost_report_tool, 'name')
-    assert get_billing_group_cost_report_tool.name == 'get-billing-group-cost-report'
+    tool = asyncio.run(billing_conductor_server.get_tool('get-billing-group-cost-report'))
+    assert tool is not None
+    assert tool.name == 'get-billing-group-cost-report'
+
+
+def test_get_billing_group_cost_report_describes_page_sizes():
+    """The description gives the 200-300 page size and what it means for a small max_items."""
+    tool = asyncio.run(billing_conductor_server.get_tool('get-billing-group-cost-report'))
+    assert tool is not None
+    description = ' '.join((tool.description or '').split())
+    assert 'Results come in pages of up to 300' in description
+    assert 'a `max_items` below 200 can return up to 200' in description
+
+
+@pytest.mark.parametrize(
+    'tool_name', ['list-billing-group-cost-reports', 'get-billing-group-cost-report']
+)
+def test_cost_report_descriptions_state_margin_sign_and_unit(tool_name):
+    """Margin is proforma minus AWS cost, and margin percentage is a fraction, not a percent."""
+    tool = asyncio.run(billing_conductor_server.get_tool(tool_name))
+    assert tool is not None
+    description = ' '.join((tool.description or '').split())
+    assert (
+        'Margin (proforma cost minus AWS cost; negative means the proforma cost is below'
+        in description
+    )
+    assert 'as a fraction, not a percent: -0.25 means -25%' in description
+    assert '"0.0" when the AWS cost is 0' in description
+    assert 'percentage of billing group margin' not in description
+
+
+@pytest.mark.parametrize(
+    'tool_name', ['list-billing-group-cost-reports', 'get-billing-group-cost-report']
+)
+def test_cost_report_descriptions_say_how_to_read_amount_strings(tool_name):
+    """Amounts are strings that can use exponent form; decimal_values gives them plain."""
+    tool = asyncio.run(billing_conductor_server.get_tool(tool_name))
+    assert tool is not None
+    description = ' '.join((tool.description or '').split())
+    assert 'exponent form ("5.0E-7")' in description
+    assert '`decimal_values`' in description
+    assert 'MONETARY AMOUNTS ARE STRINGS' in description
+    assert 'parse them as decimals, never floats' in description
 
 
 def test_list_pricing_rules_tool_registered():
     """Test that the list_pricing_rules tool is registered."""
-    assert hasattr(list_pricing_rules_tool, 'name')
-    assert list_pricing_rules_tool.name == 'list-pricing-rules'
+    tool = asyncio.run(billing_conductor_server.get_tool('list-pricing-rules'))
+    assert tool is not None
+    assert tool.name == 'list-pricing-rules'
 
 
 def test_list_pricing_plans_tool_registered():
     """Test that the list_pricing_plans tool is registered."""
-    assert hasattr(list_pricing_plans_tool, 'name')
-    assert list_pricing_plans_tool.name == 'list-pricing-plans'
+    tool = asyncio.run(billing_conductor_server.get_tool('list-pricing-plans'))
+    assert tool is not None
+    assert tool.name == 'list-pricing-plans'
+
+
+def test_get_billing_transfer_preference_tool_registered():
+    """Test that the get_billing_transfer_preference tool is registered."""
+    tool = asyncio.run(billing_conductor_server.get_tool('get-billing-transfer-preference'))
+    assert tool is not None
+    assert tool.name == 'get-billing-transfer-preference'
+    assert 'responsibility_transfer_arn' in tool.parameters.get('required', [])
 
 
 def test_list_custom_line_items_tool_registered():
     """Test that the list_custom_line_items tool is registered."""
-    assert hasattr(list_custom_line_items_tool, 'name')
-    assert list_custom_line_items_tool.name == 'list-custom-line-items'
+    tool = asyncio.run(billing_conductor_server.get_tool('list-custom-line-items'))
+    assert tool is not None
+    assert tool.name == 'list-custom-line-items'
 
 
 # --- List Billing Groups Tool Tests ---
@@ -187,7 +272,7 @@ class TestListBillingGroupsTool:
 
             assert result['status'] == STATUS_SUCCESS
             assert result['data']['total_count'] == 1
-            mock_op.assert_awaited_once_with(mock_ctx, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, None, None, None, None)
 
     async def test_list_billing_groups_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through to the operation function."""
@@ -209,7 +294,7 @@ class TestListBillingGroupsTool:
                 mock_ctx,
                 billing_period=BILLING_PERIOD,
                 filters=filters_str,
-                max_pages=5,
+                max_items=5,
                 next_token='tok123',
             )
 
@@ -280,7 +365,7 @@ class TestListBillingGroupCostReportsTool:
             result = await real_fn(mock_ctx)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, None, None, None, None)
 
     async def test_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through."""
@@ -297,7 +382,7 @@ class TestListBillingGroupCostReportsTool:
                 mock_ctx,
                 billing_period=BILLING_PERIOD,
                 filters=filters_str,
-                max_pages=2,
+                max_items=2,
                 next_token='tok',
             )
 
@@ -350,7 +435,7 @@ class TestGetBillingGroupCostReportTool:
             result = await real_fn(mock_ctx, arn=BILLING_GROUP_ARN_1)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, BILLING_GROUP_ARN_1, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, BILLING_GROUP_ARN_1, None, None, None, None)
 
     async def test_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through."""
@@ -369,7 +454,7 @@ class TestGetBillingGroupCostReportTool:
                 arn=BILLING_GROUP_ARN_1,
                 billing_period_range=range_str,
                 group_by=group_by_str,
-                max_pages=3,
+                max_items=3,
                 next_token='tok',
             )
 
@@ -418,7 +503,7 @@ class TestListPricingRulesTool:
             result = await real_fn(mock_ctx)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, None, None, None, None)
 
     async def test_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through."""
@@ -429,7 +514,7 @@ class TestListPricingRulesTool:
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
 
             await real_fn(  # type: ignore
-                mock_ctx, billing_period=BILLING_PERIOD, filters='{}', max_pages=2, next_token='t'
+                mock_ctx, billing_period=BILLING_PERIOD, filters='{}', max_items=2, next_token='t'
             )
 
             mock_op.assert_awaited_once_with(mock_ctx, BILLING_PERIOD, '{}', 2, 't')
@@ -473,7 +558,7 @@ class TestListPricingPlansTool:
             result = await real_fn(mock_ctx)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, None, None, None, None)
 
     async def test_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through."""
@@ -484,7 +569,7 @@ class TestListPricingPlansTool:
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
 
             await real_fn(  # type: ignore
-                mock_ctx, billing_period=BILLING_PERIOD, filters='{}', max_pages=3, next_token='x'
+                mock_ctx, billing_period=BILLING_PERIOD, filters='{}', max_items=3, next_token='x'
             )
 
             mock_op.assert_awaited_once_with(mock_ctx, BILLING_PERIOD, '{}', 3, 'x')
@@ -528,7 +613,7 @@ class TestListPricingRulesForPlanTool:
             result = await real_fn(mock_ctx, pricing_plan_arn=PRICING_PLAN_ARN_1)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, PRICING_PLAN_ARN_1, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, PRICING_PLAN_ARN_1, None, None, None)
 
     async def test_handles_unexpected_exception(self, mock_ctx):
         """Test that unexpected exceptions are caught by the tool wrapper."""
@@ -569,7 +654,7 @@ class TestListPricingPlansForRuleTool:
             result = await real_fn(mock_ctx, pricing_rule_arn=PRICING_RULE_ARN_1)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, PRICING_RULE_ARN_1, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, PRICING_RULE_ARN_1, None, None, None)
 
     async def test_handles_unexpected_exception(self, mock_ctx):
         """Test that unexpected exceptions are caught by the tool wrapper."""
@@ -610,7 +695,7 @@ class TestListCustomLineItemsTool:
             result = await real_fn(mock_ctx)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, None, None, None, None)
 
     async def test_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through."""
@@ -621,7 +706,7 @@ class TestListCustomLineItemsTool:
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
 
             await real_fn(  # type: ignore
-                mock_ctx, billing_period=BILLING_PERIOD, filters='{}', max_pages=5, next_token='n'
+                mock_ctx, billing_period=BILLING_PERIOD, filters='{}', max_items=5, next_token='n'
             )
 
             mock_op.assert_awaited_once_with(mock_ctx, BILLING_PERIOD, '{}', 5, 'n')
@@ -667,7 +752,7 @@ class TestListCustomLineItemVersionsTool:
             result = await real_fn(mock_ctx, arn=CUSTOM_LINE_ITEM_ARN_1)  # type: ignore
 
             assert result['status'] == STATUS_SUCCESS
-            mock_op.assert_awaited_once_with(mock_ctx, CUSTOM_LINE_ITEM_ARN_1, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, CUSTOM_LINE_ITEM_ARN_1, None, None, None)
 
     async def test_handles_unexpected_exception(self, mock_ctx):
         """Test that unexpected exceptions are caught by the tool wrapper."""
@@ -713,7 +798,7 @@ class TestListResourcesAssociatedToCustomLineItemTool:
 
             assert result['status'] == STATUS_SUCCESS
             mock_op.assert_awaited_once_with(
-                mock_ctx, CUSTOM_LINE_ITEM_ARN_1, None, None, 10, None
+                mock_ctx, CUSTOM_LINE_ITEM_ARN_1, None, None, None, None
             )
 
     async def test_handles_unexpected_exception(self, mock_ctx):
@@ -764,7 +849,7 @@ class TestListAccountAssociationsTool:
 
             assert result['status'] == STATUS_SUCCESS
             assert result['data']['total_count'] == 1
-            mock_op.assert_awaited_once_with(mock_ctx, None, None, 10, None)
+            mock_op.assert_awaited_once_with(mock_ctx, None, None, None, None)
 
     async def test_list_account_associations_passes_all_params(self, mock_ctx):
         """Test that all parameters are passed through to the operation function."""
@@ -786,7 +871,7 @@ class TestListAccountAssociationsTool:
                 mock_ctx,
                 billing_period=BILLING_PERIOD,
                 filters=filters_str,
-                max_pages=3,
+                max_items=3,
                 next_token='tok456',
             )
 
@@ -812,3 +897,174 @@ class TestListAccountAssociationsTool:
 
             assert result['status'] == STATUS_ERROR
             mock_handle.assert_awaited_once()
+
+
+# --- Get Billing Transfer Preference Tool Tests ---
+
+
+@pytest.mark.asyncio
+class TestGetBillingTransferPreferenceTool:
+    """Tests for the get_billing_transfer_preference MCP tool wrapper."""
+
+    async def test_delegates_to_operation(self, mock_ctx):
+        """Test that the tool delegates to the operation function."""
+        bc_mod = _reload_bc_with_identity_decorator()
+        real_fn = bc_mod.get_billing_transfer_preference  # type: ignore
+        transfer_arn = (
+            'arn:aws:organizations::123456789012:transfer/o-abc123/billing/inbound/rt-12345678'
+        )
+
+        with patch.object(
+            bc_mod, '_get_billing_transfer_preference', new_callable=AsyncMock
+        ) as mock_op:
+            mock_op.return_value = {
+                'status': STATUS_SUCCESS,
+                'data': {'responsibility_transfer_arn': transfer_arn},
+            }
+
+            result = await real_fn(mock_ctx, responsibility_transfer_arn=transfer_arn)  # type: ignore
+
+            assert result['status'] == STATUS_SUCCESS
+            mock_op.assert_awaited_once_with(mock_ctx, transfer_arn)
+
+    async def test_handles_unexpected_exception(self, mock_ctx):
+        """Test that unexpected exceptions are caught by the tool wrapper."""
+        bc_mod = _reload_bc_with_identity_decorator()
+        real_fn = bc_mod.get_billing_transfer_preference  # type: ignore
+
+        with (
+            patch.object(
+                bc_mod, '_get_billing_transfer_preference', new_callable=AsyncMock
+            ) as mock_op,
+            patch.object(bc_mod, 'handle_aws_error', new_callable=AsyncMock) as mock_handle,
+        ):
+            mock_op.side_effect = RuntimeError('boom')
+            mock_handle.return_value = {'status': STATUS_ERROR, 'message': 'boom'}
+
+            result = await real_fn(  # type: ignore
+                mock_ctx, responsibility_transfer_arn='arn:example'
+            )
+
+            assert result['status'] == STATUS_ERROR
+            mock_handle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_schemas_follow_the_max_items_contract():
+    """Every paginated conductor tool takes max_items + next_token; the get-preference tool neither."""
+    from awslabs.billing_cost_management_mcp_server.tools import billing_conductor_tools as bct
+
+    # Other tests reload this module under a patched FastMCP; reload the real one here.
+    real = importlib.reload(bct)
+    tools = {t.name: t for t in await real.billing_conductor_server.list_tools()}
+    assert len(tools) == 12
+    for name, tool in tools.items():
+        params = set(tool.parameters['properties'])
+        assert not {'max_pages', 'max_results', 'page_size'} & params, name
+        if name == 'get-billing-transfer-preference':
+            assert not {'max_items', 'next_token'} & params
+        else:
+            assert {'max_items', 'next_token'} <= params, name
+            assert 'max_items' in tool.description, name
+
+
+@pytest.mark.asyncio
+async def test_descriptions_state_future_billing_period_behavior():
+    """Each tool that takes a billing period says what a month after the current one does."""
+    from awslabs.billing_cost_management_mcp_server.tools import billing_conductor_tools as bct
+
+    # Other tests reload this module under a patched FastMCP; reload the real one here.
+    real = importlib.reload(bct)
+    tools = {t.name: t for t in await real.billing_conductor_server.list_tools()}
+    rejected = {'list-billing-group-cost-reports', 'get-billing-group-cost-report'}
+    projected = {
+        name
+        for name, tool in tools.items()
+        if 'billing_period' in tool.parameters['properties'] and name not in rejected
+    }
+    assert len(projected) == 8, 'a new tool takes billing_period: add it to the checks below'
+    for name in projected:
+        description = ' '.join((tools[name].description or '').split())
+        assert 'after the current month (UTC) is a projection, not a record' in description, name
+        assert '`billing_period_is_future: true`' in description, name
+    for name in rejected:
+        description = ' '.join((tools[name].description or '').split())
+        assert 'after the current month (UTC) fails with validation_error' in description, name
+
+
+@pytest.mark.asyncio
+async def test_descriptions_state_past_month_with_nothing_in_effect():
+    """Tools that answer a month with nothing in effect predictably say so; the rest stay silent."""
+    from awslabs.billing_cost_management_mcp_server.tools import billing_conductor_tools as bct
+
+    # Other tests reload this module under a patched FastMCP; reload the real one here.
+    real = importlib.reload(bct)
+    tools = {t.name: t for t in await real.billing_conductor_server.list_tools()}
+    expected = {
+        'list-billing-group-cost-reports': (
+            'A past month with no billing group in effect returns an empty list, not an error.'
+        ),
+        'get-billing-group-cost-report': (
+            'A range with no data for the billing group (for example, months before it took '
+            'effect) returns no results, not an error.'
+        ),
+        'list-resources-associated-to-custom-line-item': (
+            'was not in effect (before it started or after it ended) fails with '
+            'ResourceNotFoundException ("Custom line item does not exist."), not an empty list. '
+            'A mistyped ARN can return the same error: confirm the ARN with list-custom-line-items'
+            ' for a recent month.'
+        ),
+        'list-pricing-rules-for-plan': (
+            'fails with ResourceNotFoundException ("Pricing plan does not exist."), not an empty '
+            'list. A mistyped ARN can return the same error: confirm the ARN with list-pricing-plans'
+            ' for a recent month.'
+        ),
+        'list-pricing-plans-for-rule': (
+            'fails with ResourceNotFoundException ("Pricing rule does not exist."), not an empty '
+            'list. A mistyped ARN can return the same error: confirm the ARN with list-pricing-rules'
+            ' for a recent month.'
+        ),
+    }
+    for name, text in expected.items():
+        description = ' '.join((tools[name].description or '').split())
+        assert text in description, name
+    # These lists can be non-empty for a month with nothing in effect (very old months return
+    # historical records), or list the payer's linked accounts, so they make no such claim.
+    for name in set(tools) - set(expected):
+        description = ' '.join((tools[name].description or '').split())
+        assert 'returns an empty list' not in description, name
+        assert 'returns no results, not an error' not in description, name
+
+
+def test_example_arns_match_the_api_arn_patterns():
+    """Placeholder ARNs in the descriptions match the API's ARN patterns.
+
+    An example with a well-formed ARN fails as not found; a 3-character ID such as
+    billinggroup/abc fails on the pattern instead.
+    """
+    import botocore.session
+    import re
+
+    model = botocore.session.get_session().get_service_model('billingconductor')
+    patterns = {
+        kind: re.compile(model.shape_for(shape).metadata['pattern'])
+        for kind, shape in {
+            'billinggroup': 'BillingGroupFullArn',
+            'pricingplan': 'PricingPlanFullArn',
+            'pricingrule': 'PricingRuleArn',
+            'customlineitem': 'CustomLineItemArn',
+        }.items()
+    }
+
+    async def descriptions():
+        async with fastmcp.Client(billing_conductor_server) as client:
+            return ' '.join(t.description or '' for t in await client.list_tools())
+
+    arns = re.findall(r'arn:aws:billingconductor::\d{12}:(\w+)/(\w+)', asyncio.run(descriptions()))
+    assert len(arns) >= 10
+    bad = [
+        f'{kind}/{rid}'
+        for kind, rid in arns
+        if not patterns[kind].fullmatch(f'arn:aws:billingconductor::123456789012:{kind}/{rid}')
+    ]
+    assert not bad, bad

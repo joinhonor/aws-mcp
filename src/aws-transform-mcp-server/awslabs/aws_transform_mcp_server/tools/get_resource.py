@@ -14,7 +14,6 @@
 
 """Get resource tool handler — retrieves a single AWS Transform resource."""
 
-import asyncio
 import json
 from awslabs.aws_transform_mcp_server.audit import audited_tool
 from awslabs.aws_transform_mcp_server.config_store import is_fes_available
@@ -27,7 +26,10 @@ from awslabs.aws_transform_mcp_server.tool_utils import (
     format_job_response,
     success_result,
 )
-from awslabs.aws_transform_mcp_server.transform_api_client import call_transform_api
+from awslabs.aws_transform_mcp_server.transform_api_client import (
+    call_transform_api,
+    paginate_all,
+)
 from awslabs.aws_transform_mcp_server.transform_api_models import (
     BatchGetMessageRequest,
     CreateArtifactDownloadUrlRequest,
@@ -36,12 +38,10 @@ from awslabs.aws_transform_mcp_server.transform_api_models import (
     GetHitlTaskRequest,
     GetJobRequest,
     GetWorkspaceRequest,
-    ListJobPlanStepsRequest,
-    ListPlanUpdatesRequest,
 )
 from enum import Enum
 from loguru import logger
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 from pydantic import Field
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -73,6 +73,7 @@ class GetResourceType(str, Enum):
     asset = 'asset'
     messages = 'messages'
     plan = 'plan'
+    engagement = 'engagement'
 
 
 # ── Session helper (inlined from session.ts) ───────────────────────────────
@@ -104,10 +105,12 @@ TOOL_DESCRIPTION = (
     '- job → workspaceId, jobId. Returns basic job metadata. To check job status or '
     'determine next steps, use send_message scoped to the job instead.\n'
     '- connector → workspaceId, connectorId\n'
+    '- engagement → engagementId\n'
     '- task → workspaceId, jobId, taskId\n'
     '- artifact → workspaceId, jobId, artifactId\n'
     '- asset → workspaceId, jobId, connectorId, assetKey\n'
-    '- messages → workspaceId, messageIds (array of strings, e.g. ["msg-abc", "msg-def"]). '
+    '- messages → workspaceId or engagementId, plus messageIds '
+    '(array of strings, e.g. ["msg-abc", "msg-def"]). engagementId takes precedence. '
     'Use this after list_resources(resource="messages") to hydrate message IDs into full content. '
     'When retrying after a send_message timeout, look for parentMessageId matching the '
     'sentMessageId and messageType="FINAL_RESPONSE".\n'
@@ -156,6 +159,15 @@ class GetResourceHandler:
             Optional[str],
             Field(description='Connector ID. REQUIRED for: connector, asset'),
         ] = None,
+        engagementId: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    'Engagement ID. REQUIRED for: engagement. Alternate scope for: messages; '
+                    'takes precedence over workspaceId.'
+                )
+            ),
+        ] = None,
         taskId: Annotated[
             Optional[str],
             Field(description='Task ID. REQUIRED for: task'),
@@ -179,7 +191,16 @@ class GetResourceHandler:
         ] = None,
         savePath: Annotated[
             Optional[str],
-            Field(description='Local path to save artifact file (artifact only)'),
+            Field(
+                description=(
+                    'Local path to save artifact file (artifact only). Must resolve '
+                    'within the allowed base directory (the server working directory, '
+                    'or AWS_TRANSFORM_MCP_WRITE_DIR if set); paths outside it are '
+                    'rejected. If the server was started with the filesystem root as '
+                    'its working directory, downloads are refused until '
+                    'AWS_TRANSFORM_MCP_WRITE_DIR is set to a non-root directory.'
+                )
+            ),
         ] = None,
         fileName: Annotated[
             Optional[str],
@@ -192,12 +213,17 @@ class GetResourceHandler:
 
         # Nudge: if a jobId is provided but load_instructions hasn't been called for it.
         # Need to remove this when we add agent plugins.
-        nudge = job_needs_check(jobId)
+        nudge = (
+            None
+            if resource == GetResourceType.messages and engagementId
+            else job_needs_check(jobId)
+        )
         if nudge and resource not in (
             GetResourceType.session,
             GetResourceType.workspace,
             GetResourceType.connector,
             GetResourceType.job,
+            GetResourceType.engagement,
         ):
             return error_result(
                 'INSTRUCTIONS_REQUIRED',
@@ -255,6 +281,20 @@ class GetResourceHandler:
                     await call_transform_api(
                         'GetConnector',
                         GetConnectorRequest(workspaceId=workspaceId, connectorId=connectorId),
+                    )
+                )
+
+            # ── engagement ────────────────────────────────────────────────
+            elif resource == GetResourceType.engagement:
+                if not engagementId:
+                    return error_result(
+                        'VALIDATION_ERROR',
+                        'engagementId is required for getting an engagement.',
+                    )
+                return success_result(
+                    await call_transform_api(
+                        'GetEngagement',
+                        {'engagementId': engagementId},
                     )
                 )
 
@@ -455,9 +495,10 @@ class GetResourceHandler:
 
             # ── messages ───────────────────────────────────────────────────
             elif resource == GetResourceType.messages:
-                if not workspaceId:
+                if not workspaceId and not engagementId:
                     return error_result(
-                        'VALIDATION_ERROR', 'workspaceId is required for getting messages.'
+                        'VALIDATION_ERROR',
+                        'workspaceId or engagementId is required for getting messages.',
                     )
 
                 # If messageIds is a string, parse it as JSON
@@ -478,7 +519,8 @@ class GetResourceHandler:
                         'BatchGetMessage',
                         BatchGetMessageRequest(
                             messageIds=resolved_ids,
-                            workspaceId=workspaceId,
+                            engagementId=engagementId,
+                            workspaceId=workspaceId if not engagementId else None,
                         ),
                     )
                 )
@@ -494,40 +536,20 @@ class GetResourceHandler:
                         'VALIDATION_ERROR', 'jobId is required for getting the plan.'
                     )
 
-                results = await asyncio.gather(
-                    call_transform_api(
-                        'ListJobPlanSteps',
-                        ListJobPlanStepsRequest(workspaceId=workspaceId, jobId=jobId),
-                    ),
-                    call_transform_api(
-                        'ListPlanUpdates',
-                        ListPlanUpdatesRequest(
-                            workspaceId=workspaceId,
-                            jobId=jobId,
-                            planVersion='1',
-                            timestamp=0,
-                        ),
-                    ),
-                    return_exceptions=True,
+                plan_steps = await paginate_all(
+                    'ListJobPlanSteps',
+                    {'workspaceId': workspaceId, 'jobId': jobId},
+                    'steps',
                 )
 
-                plan_steps = None if isinstance(results[0], Exception) else results[0]
-                plan_updates = None if isinstance(results[1], Exception) else results[1]
-
-                if not plan_steps and not plan_updates:
+                if not plan_steps or not plan_steps.get('steps'):
                     return error_result(
                         'NOT_FOUND',
                         'No plan data available. The job may not have started yet.',
                         'Check job status with get_resource resource="job".',
                     )
 
-                merged: Dict[str, Any] = {}
-                if plan_steps:
-                    merged['planSteps'] = plan_steps
-                if plan_updates:
-                    merged['planUpdates'] = plan_updates
-
-                return success_result(merged)
+                return success_result({'planSteps': plan_steps})
 
             else:
                 return error_result('VALIDATION_ERROR', f'Unknown resource type: {resource}')

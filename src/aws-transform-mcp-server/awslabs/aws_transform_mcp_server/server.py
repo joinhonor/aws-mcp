@@ -14,7 +14,7 @@
 
 """Entry point for the AWS Transform MCP server.
 
-Creates a FastMCP instance with full guidance instructions and registers
+Creates a MCPServer instance with full guidance instructions and registers
 all tool handlers.
 """
 
@@ -32,8 +32,8 @@ from awslabs.aws_transform_mcp_server.config_store import (
     set_sigv4_regions,
 )
 from awslabs.aws_transform_mcp_server.consts import (
-    FES_REGIONS,
     PROFILE_DISCOVERY_TIMEOUT_SECONDS,
+    fes_regions_for,
 )
 from awslabs.aws_transform_mcp_server.tools.adaptive_poll import AdaptivePollHandler
 from awslabs.aws_transform_mcp_server.tools.artifact import ArtifactHandler
@@ -41,6 +41,8 @@ from awslabs.aws_transform_mcp_server.tools.chat import ChatHandler
 from awslabs.aws_transform_mcp_server.tools.collaborator import CollaboratorHandler
 from awslabs.aws_transform_mcp_server.tools.configure import ConfigureHandler
 from awslabs.aws_transform_mcp_server.tools.connector import ConnectorHandler
+from awslabs.aws_transform_mcp_server.tools.download_artifact import DownloadArtifactHandler
+from awslabs.aws_transform_mcp_server.tools.engagement import EngagementHandler
 from awslabs.aws_transform_mcp_server.tools.get_resource import GetResourceHandler
 from awslabs.aws_transform_mcp_server.tools.hitl import HitlHandler
 from awslabs.aws_transform_mcp_server.tools.job import JobHandler
@@ -50,7 +52,7 @@ from awslabs.aws_transform_mcp_server.tools.load_instructions import LoadInstruc
 from awslabs.aws_transform_mcp_server.tools.workspace import WorkspaceHandler
 from awslabs.aws_transform_mcp_server.transform_api_client import call_fes_direct_sigv4
 from loguru import logger
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pathlib import Path
 
 
@@ -60,7 +62,7 @@ from pathlib import Path
 # tool behavior belongs in each tool's description, not here.
 # ---------------------------------------------------------------------------
 
-INSTRUCTIONS = """AWS Transform MCP Server — manage workspaces, jobs, tasks, connectors, artifacts, and agents.
+INSTRUCTIONS = """AWS Transform MCP Server — manage workspaces, jobs, tasks, connectors, engagements, artifacts, and agents.
 
 # Authentication
 
@@ -89,6 +91,7 @@ If `get_status` shows a valid connection (any method), do NOT call `configure`.
 - Chat with the Transform assistant → `send_message`
 - Browse collections → `list_resources`
 - Fetch a single resource with full details → `get_resource`
+- Create or modify an engagement → `manage_engagement`
 - Check connection health → `get_status`
 
 # Workflows
@@ -127,23 +130,24 @@ may still be generating.
 
 # Constraints
 
-- MUST NOT delete workspaces or jobs without explicit user confirmation.
+- MUST NOT delete workspaces or jobs, reject engagement invitations, or remove engagement
+  resources without explicit user confirmation.
 """
 
 
-def create_server() -> FastMCP:
-    """Create and return a configured FastMCP server instance.
+def create_server() -> MCPServer:
+    """Create and return a configured MCPServer server instance.
 
     Separated from main() for testability.
     """
-    return FastMCP(
+    return MCPServer(
         'awslabs.aws-transform-mcp-server',
         instructions=INSTRUCTIONS,
         dependencies=['boto3', 'botocore[crt]', 'pydantic', 'loguru', 'httpx'],
     )
 
 
-def _register_handlers(mcp: FastMCP) -> None:
+def _register_handlers(mcp: MCPServer) -> None:
     """Import and instantiate all tool handler classes on *mcp*.
 
     All tools are registered at startup regardless of auth state.
@@ -155,8 +159,10 @@ def _register_handlers(mcp: FastMCP) -> None:
     JobHandler(mcp)
     HitlHandler(mcp)
     ArtifactHandler(mcp)
+    DownloadArtifactHandler(mcp)
     ChatHandler(mcp)
     ConnectorHandler(mcp)
+    EngagementHandler(mcp)
     ListResourcesHandler(mcp)
     GetResourceHandler(mcp)
     CollaboratorHandler(mcp)
@@ -198,7 +204,7 @@ async def _probe_sigv4_transform_api() -> None:
         return
 
     logger.info('Credential probe: credentials found, starting region discovery')
-    regions = await _discover_sigv4_regions()
+    regions = await _discover_sigv4_regions(AwsHelper.resolve_region(session))
 
     if len(regions) == 0:
         set_sigv4_fes_available(False)
@@ -220,8 +226,12 @@ async def _probe_sigv4_transform_api() -> None:
         )
 
 
-async def _discover_sigv4_regions() -> list[str]:
-    """Fan out ListWorkspaces across all supported regions.
+async def _discover_sigv4_regions(caller_region: str) -> list[str]:
+    """Fan out ListWorkspaces across the supported regions of one partition.
+
+    Args:
+        caller_region: The resolved AWS region, used to pick the partition's
+            region list — GovCloud credentials cannot reach a commercial FES.
 
     Returns list of region strings where the call succeeded (account has
     a credential-enabled profile in that region).
@@ -248,7 +258,7 @@ async def _discover_sigv4_regions() -> list[str]:
             logger.info('Region discovery failed for {}: {}', region, exc)
             return None
 
-    results = await asyncio.gather(*[_call_region(r) for r in FES_REGIONS])
+    results = await asyncio.gather(*[_call_region(r) for r in fes_regions_for(caller_region)])
     return [r for r in results if r is not None]
 
 

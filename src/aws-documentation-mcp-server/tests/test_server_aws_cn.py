@@ -16,21 +16,29 @@
 import httpx
 import pytest
 from awslabs.aws_documentation_mcp_server.server_aws_cn import (
+    CN_ALLOWED_DOMAIN_REGEXES,
     get_available_services,
     main,
 )
 from awslabs.aws_documentation_mcp_server.server_aws_cn import (
     read_documentation as read_documentation_china,
 )
+from awslabs.aws_documentation_mcp_server.util import url_matches_allowlist
+from mcp.server.mcpserver import Context
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-class MockContext:
+class MockContext(Context):
     """Mock context for testing."""
 
-    async def error(self, message):
+    def __init__(self) -> None:
+        """Initialize with no request context; nothing here needs one."""
+        super().__init__()
+
+    async def error(self, data: Any, *, logger_name: Optional[str] = None):
         """Mock error method."""
-        print(f'Error: {message}')
+        print(f'Error: {data}')
 
 
 class TestReadDocumentationChina:
@@ -44,6 +52,7 @@ class TestReadDocumentationChina:
 
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.url = url
         mock_response.text = '<html><body><h1>Test</h1><p>This is a test.</p></body></html>'
         mock_response.headers = {'content-type': 'text/html'}
 
@@ -97,10 +106,8 @@ class TestReadDocumentationChina:
         with patch('httpx.AsyncClient.get', new_callable=AsyncMock) as mock_get:
             mock_get.side_effect = httpx.HTTPError('Connection error')
 
-            result = await read_documentation_china(ctx, url=url, max_length=10000, start_index=0)
-
-            assert 'Failed to fetch' in result
-            assert 'Connection error' in result
+            with pytest.raises(ValueError, match='Connection error'):
+                await read_documentation_china(ctx, url=url, max_length=10000, start_index=0)
             mock_get.assert_called_once()
 
 
@@ -160,6 +167,44 @@ class TestGetAvailableServices:
                 mock_extract.assert_called_once()
                 called_url = mock_get.call_args[0][0]
                 assert '?session=' in called_url
+
+    @pytest.mark.asyncio
+    async def test_get_available_services_keeps_catalogue_when_page_is_unreadable(self):
+        """A page that will not simplify must not discard the service list already fetched."""
+        ctx = MockContext()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.url = 'https://docs.amazonaws.cn/en_us/aws/latest/userguide/services.html'
+        mock_response.text = '<html><body></body></html>'  # simplifies to nothing
+        mock_response.headers = {'content-type': 'text/html'}
+
+        mock_toc_response = MagicMock()
+        mock_toc_response.status_code = 200
+        mock_toc_response.json = lambda: {
+            'contents': [
+                {
+                    'title': 'Documentation by Service',
+                    'href': 'services.html',
+                    'contents': [
+                        {'title': 'Amazon Simple Storage Service', 'href': 's3.html'},
+                        {'title': 'Amazon Elastic Compute Cloud', 'href': 'ec2.html'},
+                    ],
+                }
+            ]
+        }
+        mock_toc_response.headers = {'content-type': 'application/json'}
+
+        with patch('httpx.AsyncClient.get', new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = [mock_response, mock_toc_response]
+            result = await get_available_services(ctx)
+
+        assert 'Amazon Simple Storage Service' in result
+        assert 'Amazon Elastic Compute Cloud' in result
+        assert '## Services in Amazon Web Services China' in result
+        # the read failure is reported, not dropped, and not tagged as an error marker
+        assert 'Note: Page failed to be simplified from HTML' in result
+        assert '<e>' not in result
 
     @pytest.mark.asyncio
     async def test_get_available_services_error(self):
@@ -280,6 +325,112 @@ class TestGetAvailableServices:
                 assert '?session=' in called_url
 
 
+def _install_cn_mock_transport(monkeypatch, routes, target_module):
+    """Force AsyncClient in target_module to use a MockTransport, preserving real event_hooks.
+
+    Preserving the real hooks means a regression that dropped the redirect guard would leak
+    the redirect body and fail these tests.
+    """
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs['transport'] = httpx.MockTransport(routes)
+        kwargs.setdefault('follow_redirects', True)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(f'{target_module}.httpx.AsyncClient', patched)
+
+
+def _cn_imds_redirect_routes(request: httpx.Request) -> httpx.Response:
+    """docs.amazonaws.cn 302s to IMDS; IMDS would leak a marker if the redirect were followed."""
+    if request.url.host == 'docs.amazonaws.cn':
+        return httpx.Response(
+            302, headers={'location': 'http://169.254.169.254/latest/meta-data/'}
+        )
+    return httpx.Response(200, text='SENSITIVE-IMDS-DATA')
+
+
+class TestCnAllowlist:
+    """The CN allowlist gates only docs.amazonaws.cn."""
+
+    def test_cn_host_allowed(self):
+        """docs.amazonaws.cn is on the CN allowlist."""
+        assert url_matches_allowlist(
+            'https://docs.amazonaws.cn/en_us/x.html', CN_ALLOWED_DOMAIN_REGEXES
+        )
+
+    def test_commercial_host_rejected(self):
+        """The commercial docs host is not on the CN allowlist."""
+        assert not url_matches_allowlist(
+            'https://docs.aws.amazon.com/x.html', CN_ALLOWED_DOMAIN_REGEXES
+        )
+
+    def test_imds_rejected(self):
+        """IMDS is not on the CN allowlist."""
+        assert not url_matches_allowlist(
+            'http://169.254.169.254/latest/meta-data/', CN_ALLOWED_DOMAIN_REGEXES
+        )
+
+
+class TestCnRedirectEnforcement:
+    """Both CN fetch sites re-validate redirect targets against CN_ALLOWED_DOMAIN_REGEXES."""
+
+    @pytest.mark.asyncio
+    async def test_read_documentation_offsite_redirect_blocked(self, monkeypatch):
+        """read_documentation (via read_documentation_impl) refuses an IMDS redirect."""
+        ctx = MockContext()
+        _install_cn_mock_transport(
+            monkeypatch,
+            _cn_imds_redirect_routes,
+            'awslabs.aws_documentation_mcp_server.server_utils',
+        )
+        with pytest.raises(ValueError, match='Failed to fetch') as excinfo:
+            await read_documentation_china(
+                ctx,
+                url='https://docs.amazonaws.cn/en_us/test.html',
+                max_length=1000,
+                start_index=0,
+            )
+        assert 'SENSITIVE-IMDS-DATA' not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_get_available_services_offsite_redirect_blocked(self, monkeypatch):
+        """get_available_services (its own inline client) refuses an IMDS redirect."""
+        ctx = MockContext()
+        _install_cn_mock_transport(
+            monkeypatch,
+            _cn_imds_redirect_routes,
+            'awslabs.aws_documentation_mcp_server.server_aws_cn',
+        )
+        result = await get_available_services(ctx)
+        assert 'SENSITIVE-IMDS-DATA' not in result
+        assert 'Failed to fetch' in result
+
+    @pytest.mark.asyncio
+    async def test_read_documentation_onsite_redirect_followed(self, monkeypatch):
+        """A same-domain (docs.amazonaws.cn) redirect is followed and content returned."""
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            if request.url.path == '/en_us/test.html':
+                return httpx.Response(
+                    301, headers={'location': 'https://docs.amazonaws.cn/en_us/final.html'}
+                )
+            return httpx.Response(
+                200,
+                text='<html><body><h1>Final CN</h1></body></html>',
+                headers={'content-type': 'text/html'},
+            )
+
+        ctx = MockContext()
+        _install_cn_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_documentation_china(
+            ctx, url='https://docs.amazonaws.cn/en_us/test.html', max_length=1000, start_index=0
+        )
+        assert 'Final CN' in result
+
+
 class TestMain:
     """Tests for the main function."""
 
@@ -292,3 +443,21 @@ class TestMain:
                 main()
                 mock_logger.assert_called_once_with('Starting AWS China Documentation MCP Server')
                 mock_run.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_read_documentation_china_fetches_html_page_for_md_url():
+    """A .md URL reads the .html page at the same path."""
+    with patch(
+        'awslabs.aws_documentation_mcp_server.server_aws_cn.read_documentation_impl',
+        new_callable=AsyncMock,
+    ) as impl:
+        await read_documentation_china(
+            MockContext(),
+            url='https://docs.amazonaws.cn/en_us/lambda/latest/dg/invocation-sync.md',
+            max_length=1000,
+            start_index=0,
+        )
+    assert impl.call_args.args[1] == (
+        'https://docs.amazonaws.cn/en_us/lambda/latest/dg/invocation-sync.html'
+    )

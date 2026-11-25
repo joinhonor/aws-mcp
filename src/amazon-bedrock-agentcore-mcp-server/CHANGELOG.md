@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- **Web Search primitive** — `web_search` tool backed by the AgentCore Web Search API (`InvokeWebSearch`), with domain include/exclude and publication-date filters. Requests are SigV4-signed with the standard boto3 credential chain. Enable it alone with `AGENTCORE_ENABLE_TOOLS=web_search`. Raises the `boto3` floor to 1.43.127, which includes `InvokeWebSearch`
+
+- **Code Interpreter `list_files`** — list files and directories in a sandbox session, so an agent can discover what a previous step wrote instead of guessing paths. Accepts an optional `directory_path` and returns structured file paths alongside the raw listing text
+
+### Fixed
+
+- **Browser `browser_evaluate`** — preserve non-ASCII text (CJK, emoji) in object/array results instead of emitting `\uXXXX` escapes, matching the scalar-string return path (`ensure_ascii=False`)
+- Server crash on startup when the configured `llms.txt` documentation source is unreachable (#4138). The hardcoded default URL (`aws.github.io/bedrock-agentcore-starter-toolkit/llms.txt`) was deprecated and returns HTTP 404, causing an unhandled `HTTPError` to propagate out of `main()` and kill the process before MCP initialization. `load_links_only()` now isolates each source and logs a warning on fetch failure so the server starts with all other tool groups functional. The default source was also updated to the official AWS AgentCore Developer Guide index (`docs.aws.amazon.com/bedrock-agentcore/latest/devguide/llms.txt`), restoring documentation search
+
 ## 0.1.0 - 2026-05-14
 
 ### Added

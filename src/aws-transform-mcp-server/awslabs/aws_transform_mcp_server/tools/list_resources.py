@@ -14,7 +14,6 @@
 
 """List resources tool handler — dispatches to API/control-plane based on resource type."""
 
-import asyncio
 from awslabs.aws_transform_mcp_server.audit import audited_tool
 from awslabs.aws_transform_mcp_server.config_store import (
     is_fes_available,
@@ -39,20 +38,19 @@ from awslabs.aws_transform_mcp_server.transform_api_client import (
 from awslabs.aws_transform_mcp_server.transform_api_models import (
     BatchGetMessageRequest,
     BatchGetUserDetailsRequest,
+    ChatEngagementMetadata,
     ChatJobMetadata,
     ListJobPlanStepsRequest,
     ListMessagesRequest,
-    ListPlanUpdatesRequest,
     Metadata,
     ResourcesOnScreen,
     SearchUsersTypeaheadRequest,
     WorkspaceMetadata,
 )
 from enum import Enum
-from loguru import logger
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 from pydantic import Field
-from typing import Annotated, Any, Callable, Dict, Optional
+from typing import Annotated, Any, Callable, Dict, Literal, Optional
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -84,6 +82,13 @@ class ResourceType(str, Enum):
     agents = 'agents'
     collaborators = 'collaborators'
     users = 'users'
+    engagements = 'engagements'
+    engagement_invitations = 'engagement_invitations'
+    engagement_tenants = 'engagement_tenants'
+    engagement_users = 'engagement_users'
+    engagement_workspaces = 'engagement_workspaces'
+    workspace_engagements = 'workspace_engagements'
+    partner_types = 'partner_types'
 
 
 class TaskTypeEnum(str, Enum):
@@ -200,10 +205,12 @@ async def paginated_fes(
 
 TOOL_DESCRIPTION = (
     'Lists AWS Transform resources by type. Auto-paginates server-side for: '
-    'workspaces, jobs, connectors, tasks, artifacts, worklogs, agents, collaborators. '
+    'workspaces, jobs, connectors, tasks, artifacts, worklogs, agents, collaborators, '
+    'engagements, engagement_invitations, engagement_tenants, engagement_users, '
+    'engagement_workspaces, workspace_engagements, and partner_types. '
     'These return ALL results in one call — do NOT pass nextToken. '
     'Manual pagination (nextToken) is used by: messages, plan '
-    '(stepsNextToken/updatesNextToken).\n\n'
+    '(stepsNextToken).\n\n'
     'Resource types and required parameters:\n'
     '- workspaces → (none)\n'
     '- jobs → workspaceId\n'
@@ -213,17 +220,25 @@ TOOL_DESCRIPTION = (
     '- artifacts → workspaceId, jobId. When jobId is provided, both stores are queried '
     'the S3 connector output (transform-output/{jobId}/) and the managed artifact store '
     '(AWSTransform/Workspaces/{workspaceId}/Jobs/{jobId}/). \n'
-    '- messages → workspaceId (jobId optional). Returns full message content. '
+    '- messages → workspaceId or engagementId (jobId optional for workspace scope). '
+    'engagementId takes precedence. Returns full message content. '
     'Uses nextToken for pagination (not auto-paginated). '
     'Use startTimestamp (epoch seconds) to filter messages after a point in time — '
     'this is how you check for a reply after send_message times out.\n'
     '- worklogs → workspaceId, jobId (optional: stepId OR startTime/endTime)\n'
-    '- plan → workspaceId, jobId. Uses stepsNextToken/updatesNextToken (not auto-paginated).\n'
+    '- plan → workspaceId, jobId. Uses stepsNextToken (not auto-paginated).\n'
     '- agents → (none). Optional filters: agentType, ownerType, or jobOrchestrator.\n'
     '- collaborators → workspaceId. Returns members with enriched user details '
     '(userName, displayName, email).\n'
     '- users → searchTerm. Search by username or email. Use this to find a userId '
-    'before calling manage_collaborator.\n\n'
+    'before calling manage_collaborator.\n'
+    '- engagements → (none)\n'
+    '- engagement_invitations → (none)\n'
+    '- engagement_tenants → engagementId\n'
+    '- engagement_users → engagementId. Optional: filterRole, filterTenantId.\n'
+    '- engagement_workspaces → engagementId. Optional: filterTenantId.\n'
+    '- workspace_engagements → workspaceId\n'
+    '- partner_types → (none). Returns valid partner roles for engagement actions.\n\n'
     'Errors: NOT_CONFIGURED (call configure first), INSTRUCTIONS_REQUIRED '
     '(call load_instructions for the job first), VALIDATION_ERROR (missing required params).'
 )
@@ -249,8 +264,29 @@ class ListResourcesHandler:
         workspaceId: Annotated[
             Optional[str],
             Field(
-                description='Workspace ID. REQUIRED for: jobs, connectors, tasks, artifacts, plan'
+                description=(
+                    'Workspace ID. REQUIRED for: jobs, connectors, tasks, artifacts, plan, '
+                    'workspace_engagements. Alternate scope for: messages.'
+                )
             ),
+        ] = None,
+        engagementId: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    'Engagement ID. REQUIRED for: engagement_tenants, engagement_users, '
+                    'engagement_workspaces. Alternate scope for: messages; takes precedence '
+                    'over workspaceId and jobId.'
+                )
+            ),
+        ] = None,
+        filterTenantId: Annotated[
+            Optional[str],
+            Field(description='Tenant filter for engagement_users or engagement_workspaces.'),
+        ] = None,
+        filterRole: Annotated[
+            Optional[Literal['LEAD']],
+            Field(description='Role filter for engagement_users.'),
         ] = None,
         jobId: Annotated[
             Optional[str],
@@ -361,10 +397,6 @@ class ListResourcesHandler:
             Optional[str],
             Field(description='Pagination token for plan steps (plan only)'),
         ] = None,
-        updatesNextToken: Annotated[
-            Optional[str],
-            Field(description='Pagination token for plan updates (plan only)'),
-        ] = None,
         searchTerm: Annotated[
             Optional[str],
             Field(description='Search term for users resource. Required when resource="users".'),
@@ -383,7 +415,7 @@ class ListResourcesHandler:
             Field(
                 description=(
                     'Pagination token. Only used by: messages. '
-                    'For plan use stepsNextToken/updatesNextToken. '
+                    'For plan use stepsNextToken. '
                     'Ignored for auto-paginated resources.'
                 )
             ),
@@ -395,12 +427,21 @@ class ListResourcesHandler:
             return NOT_CONFIGURED()
 
         # Nudge: if a jobId is provided but load_instructions hasn't been called for it
-        nudge = job_needs_check(jobId)
+        nudge = (
+            None if resource == ResourceType.messages and engagementId else job_needs_check(jobId)
+        )
         if nudge and resource not in (
             ResourceType.workspaces,
             ResourceType.jobs,
             ResourceType.connectors,
             ResourceType.agents,
+            ResourceType.engagements,
+            ResourceType.engagement_invitations,
+            ResourceType.engagement_tenants,
+            ResourceType.engagement_users,
+            ResourceType.engagement_workspaces,
+            ResourceType.workspace_engagements,
+            ResourceType.partner_types,
         ):
             return error_result(
                 'INSTRUCTIONS_REQUIRED',
@@ -431,6 +472,77 @@ class ListResourcesHandler:
                 )
                 items = raw.get('connectors', []) if isinstance(raw, dict) else []
                 return success_result({'items': [format_connector_summary(c) for c in items]})
+
+            elif resource == ResourceType.engagements:
+                raw = await paginate_all('ListEngagements', {}, 'engagements')
+                items = raw.get('engagements', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
+
+            elif resource == ResourceType.engagement_invitations:
+                raw = await paginate_all('ListEngagementInvitations', {}, 'invitations')
+                items = raw.get('invitations', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
+
+            elif resource == ResourceType.engagement_tenants:
+                if not engagementId:
+                    return error_result(
+                        'VALIDATION_ERROR',
+                        'engagementId is required for listing engagement tenants.',
+                    )
+                raw = await paginate_all(
+                    'ListEngagementTenants',
+                    {'engagementId': engagementId},
+                    'tenants',
+                )
+                items = raw.get('tenants', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
+
+            elif resource == ResourceType.engagement_users:
+                if not engagementId:
+                    return error_result(
+                        'VALIDATION_ERROR',
+                        'engagementId is required for listing engagement users.',
+                    )
+                body: Dict[str, Any] = {'engagementId': engagementId}
+                if filterRole is not None:
+                    body['filterRole'] = filterRole
+                if filterTenantId is not None:
+                    body['filterTenantId'] = filterTenantId
+                raw = await paginate_all('ListEngagementUsers', body, 'users')
+                items = raw.get('users', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
+
+            elif resource == ResourceType.engagement_workspaces:
+                if not engagementId:
+                    return error_result(
+                        'VALIDATION_ERROR',
+                        'engagementId is required for listing engagement workspaces.',
+                    )
+                body = {'engagementId': engagementId}
+                if filterTenantId is not None:
+                    body['filterTenantId'] = filterTenantId
+                raw = await paginate_all('ListEngagementWorkspaces', body, 'workspaces')
+                items = raw.get('workspaces', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
+
+            elif resource == ResourceType.workspace_engagements:
+                if not workspaceId:
+                    return error_result(
+                        'VALIDATION_ERROR',
+                        'workspaceId is required for listing workspace engagements.',
+                    )
+                raw = await paginate_all(
+                    'ListEngagementsForWorkspace',
+                    {'workspaceId': workspaceId},
+                    'items',
+                )
+                items = raw.get('items', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
+
+            elif resource == ResourceType.partner_types:
+                raw = await call_transform_api('ListPartnerTypes', {})
+                items = raw.get('partnerTypes', []) if isinstance(raw, dict) else []
+                return success_result({'items': items})
 
             elif resource == ResourceType.tasks:
                 if not workspaceId:
@@ -503,16 +615,30 @@ class ListResourcesHandler:
                 return success_result(merged)
 
             elif resource == ResourceType.messages:
-                if not workspaceId:
+                if not workspaceId and not engagementId:
                     return error_result(
-                        'VALIDATION_ERROR', 'workspaceId is required for listing messages.'
+                        'VALIDATION_ERROR',
+                        'workspaceId or engagementId is required for listing messages.',
                     )
-                ws_meta = WorkspaceMetadata(
-                    workspaceId=workspaceId,
-                    jobs=([ChatJobMetadata(jobId=jobId, focusState='ACTIVE')] if jobId else None),
+                resources_on_screen = ResourcesOnScreen(
+                    engagement=(
+                        ChatEngagementMetadata(engagementId=engagementId) if engagementId else None
+                    ),
+                    workspace=(
+                        WorkspaceMetadata(
+                            workspaceId=workspaceId,
+                            jobs=(
+                                [ChatJobMetadata(jobId=jobId, focusState='ACTIVE')]
+                                if jobId
+                                else None
+                            ),
+                        )
+                        if workspaceId and not engagementId
+                        else None
+                    ),
                 )
                 list_req = ListMessagesRequest(
-                    metadata=Metadata(resourcesOnScreen=ResourcesOnScreen(workspace=ws_meta)),
+                    metadata=Metadata(resourcesOnScreen=resources_on_screen),
                     startTimestamp=startTimestamp,
                     maxResults=maxResults,
                     nextToken=nextToken,
@@ -536,7 +662,11 @@ class ListResourcesHandler:
                     batch = message_ids[i : i + 100]
                     batch_result = await call_transform_api(
                         'BatchGetMessage',
-                        BatchGetMessageRequest(messageIds=batch, workspaceId=workspaceId),
+                        BatchGetMessageRequest(
+                            messageIds=batch,
+                            engagementId=engagementId,
+                            workspaceId=workspaceId if not engagementId else None,
+                        ),
                     )
                     if isinstance(batch_result, dict):
                         all_messages.extend(batch_result.get('messages', []))
@@ -596,59 +726,27 @@ class ListResourcesHandler:
                     maxResults=maxResults,
                     nextToken=(stepsNextToken or nextToken),
                 )
-                updates_req = ListPlanUpdatesRequest(
-                    workspaceId=workspaceId,
-                    jobId=jobId,
-                    timestamp=0,
-                    planVersion='1',
-                    nextToken=(updatesNextToken or nextToken),
-                )
 
-                results = await asyncio.gather(
-                    call_transform_api('ListJobPlanSteps', steps_req),
-                    call_transform_api('ListPlanUpdates', updates_req),
-                    return_exceptions=True,
-                )
+                plan_steps = await call_transform_api('ListJobPlanSteps', steps_req)
 
-                plan_steps_result = results[0]
-                plan_updates_result = results[1]
+                # Extract and remap the nested nextToken field. An empty page can
+                # still carry a nextToken (the server filters per page), so only an
+                # empty page WITHOUT a token means the job has no plan yet.
+                steps_token = None
+                if isinstance(plan_steps, dict):
+                    steps_token = plan_steps.pop('nextToken', None)
 
-                if isinstance(plan_steps_result, Exception):
-                    logger.error(f'ListJobPlanSteps failed: {plan_steps_result}')
-                    plan_steps = None
-                else:
-                    plan_steps = plan_steps_result
-
-                if isinstance(plan_updates_result, Exception):
-                    logger.error(f'ListPlanUpdates failed: {plan_updates_result}')
-                    plan_updates = None
-                else:
-                    plan_updates = plan_updates_result
-
-                if not plan_steps and not plan_updates:
+                has_steps = isinstance(plan_steps, dict) and plan_steps.get('steps')
+                if not has_steps and not steps_token:
                     return error_result(
                         'NOT_FOUND',
                         'No plan data available. The job may not have started yet.',
                         'Check job status with list_resources resource="jobs".',
                     )
 
-                # Extract and remap nested nextToken fields
-                steps_token = None
-                updates_token = None
-                if isinstance(plan_steps, dict):
-                    steps_token = plan_steps.pop('nextToken', None)
-                if isinstance(plan_updates, dict):
-                    updates_token = plan_updates.pop('nextToken', None)
-
-                merged: Dict[str, Any] = {}
-                if plan_steps:
-                    merged['planSteps'] = plan_steps
-                if plan_updates:
-                    merged['planUpdates'] = plan_updates
+                merged: Dict[str, Any] = {'planSteps': plan_steps}
                 if steps_token:
                     merged['stepsNextToken'] = steps_token
-                if updates_token:
-                    merged['updatesNextToken'] = updates_token
 
                 return success_result(merged)
 

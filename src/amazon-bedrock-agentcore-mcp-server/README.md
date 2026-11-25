@@ -6,7 +6,7 @@ Model Context Protocol (MCP) server for Amazon Bedrock AgentCore — providing o
 
 This MCP server gives AI agents (Claude Code, Kiro, Cursor, VS Code, Codex CLI) direct access to AgentCore platform APIs. Agents can create and manage runtimes, store and retrieve memories, configure identity providers, deploy gateways, and manage policies — all through standard MCP tool calls backed by real boto3 API calls.
 
-**122 tools** across 7 operational primitives + documentation search.
+**123 tools** across 8 operational primitives + documentation search.
 
 |Primitive           |Tools|What it does                                                                                   |
 |--------------------|----:|-----------------------------------------------------------------------------------------------|
@@ -16,7 +16,8 @@ This MCP server gives AI agents (Claude Code, Kiro, Cursor, VS Code, Codex CLI) 
 |**Gateway**         |15   |Create and manage API gateways, gateway targets, resource policies                             |
 |**Policy**          |15   |Create policy engines, manage policies, generate and review policy assets                      |
 |**Browser**         |25   |Cloud-based browser automation — navigate, click, type, screenshot, extract data               |
-|**Code Interpreter**|9    |Sandboxed code execution, file upload/download, package installation                           |
+|**Code Interpreter**|10   |Sandboxed code execution, file upload/download/listing, package installation                   |
+|**Web Search**      |1    |Search the web with domain and publication-date filters                                        |
 |**Documentation**   |2    |Search and fetch AgentCore docs                                                                |
 
 ## Prerequisites
@@ -129,13 +130,49 @@ Tips:
 - Use `browser_evaluate` with `querySelectorAll` for data extraction
 - `timeout_seconds` is an idle timeout, not absolute duration
 
-### Code Interpreter (9 tools)
+### Code Interpreter (10 tools)
 
 Sandboxed code execution in isolated environments. Start a session, execute code or shell commands, install packages, and transfer files.
 
-Key tools: `start_code_interpreter_session`, `execute_code`, `execute_command`, `install_packages`, `upload_file`, `download_file`
+Key tools: `start_code_interpreter_session`, `execute_code`, `execute_command`, `install_packages`, `upload_file`, `download_file`, `list_files`
 
 > **Cost note:** Sessions incur AWS charges. Stop sessions when done.
+
+### Web Search (1 tool)
+
+Search the web with the AgentCore Web Search API (`InvokeWebSearch`). Each result has a title, URL, publication time and a text extract from the page. You can restrict results to or away from specific domains, and to a publication-date range.
+
+Key tool: `web_search`
+
+This gives an agent web search on clients that have none built in, for example Claude Code running on Amazon Bedrock. To load only this tool and the two documentation tools, set `AGENTCORE_ENABLE_TOOLS=web_search`:
+
+```json
+{
+  "mcpServers": {
+    "agentcore-web-search": {
+      "command": "uvx",
+      "args": ["awslabs.amazon-bedrock-agentcore-mcp-server@latest"],
+      "env": {
+        "AGENTCORE_ENABLE_TOOLS": "web_search",
+        "AWS_PROFILE": "your-profile",
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}
+```
+
+The caller needs this IAM permission:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "bedrock-agentcore:InvokeWebSearch",
+  "Resource": "arn:aws:bedrock-agentcore:*:aws:tool/web-search.v1"
+}
+```
+
+> **Cost note:** Each `web_search` call is a billable query.
 
 ### Documentation (2 tools)
 
@@ -158,7 +195,7 @@ Billable and destructive tools include `COST WARNING:` or `WARNING:` in their de
 
 - All API calls use boto3 with credentials resolved from your environment (AWS_PROFILE, env vars, or IAM role)
 - Operations that return credential material (tokens, API keys, secrets) are excluded from MCP tools — credentials should not flow through LLM context
-- Retrieved content (memory records, gateway responses) should be treated as untrusted input
+- Retrieved content (memory records, gateway responses, web search results) should be treated as untrusted input
 - User-agent tracking (`agentcore-mcp-server/{version} {primitive}`) is included in API calls for usage analytics — no telemetry is sent elsewhere
 
 ## Architecture
@@ -173,7 +210,8 @@ tools/
 ├── gateway/       # 15 tools — API gateway management
 ├── policy/        # 15 tools — policy engine management
 ├── browser/       # 25 tools — cloud browser automation
-├── code_interpreter/  # 9 tools — sandboxed code execution
+├── code_interpreter/  # 10 tools — sandboxed code execution
+├── web_search/    # 1 tool — web search
 └── docs.py        # 2 tools — documentation search
 ```
 

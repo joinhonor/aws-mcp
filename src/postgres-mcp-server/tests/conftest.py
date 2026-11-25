@@ -1,6 +1,7 @@
 import pytest
 from botocore.exceptions import ClientError
 from enum import Enum
+from mcp.server.mcpserver import Context
 from typing import Any, Dict, List, Optional
 
 
@@ -246,14 +247,19 @@ class Mock_DBConnection:
             return self.data_client.execute_statement(sql=sql, parameters=parameters)
 
 
-class DummyCtx:
+class DummyCtx(Context):
     """Mock implementation of MCP context for testing purposes."""
 
-    async def error(self, message):
+    def __init__(self) -> None:
+        """Initialize with no request context; nothing here needs one."""
+        super().__init__()
+
+    async def error(self, data: Any, *, logger_name: Optional[str] = None):
         """Mock MCP ctx.error with the given message.
 
         Args:
-            message: The error message
+            data: The error message
+            logger_name: Accepted for signature compatibility with Context.error; unused
         """
         # Do nothing because MCP ctx.error doesn't throw exception
         pass
@@ -595,3 +601,23 @@ def mock_PsycopgPoolConnection():
         region='us-east-1',
         is_test=True,
     )
+
+
+@pytest.fixture(autouse=True)
+def _clear_proxy_lookup_cache():
+    """Reset the RDS Proxy lookup cache around every test.
+
+    ``find_proxy_for_instance`` memoizes per (region, instance) with a short TTL,
+    in module-level state. Without this, a result cached by one test is returned to
+    the next one that happens to use the same region and instance identifier -- so
+    a test asserting "no proxy found" could pass or fail depending on which tests
+    ran before it. Autouse because the cache is global: any test that reaches the
+    lookup, directly or through internal_create_connection, is affected.
+    """
+    from awslabs.postgres_mcp_server.connection.cp_api_connection import (
+        clear_proxy_lookup_cache,
+    )
+
+    clear_proxy_lookup_cache()
+    yield
+    clear_proxy_lookup_cache()

@@ -17,28 +17,37 @@
 from awslabs.aws_healthomics_mcp_server.consts import (
     CACHE_BEHAVIORS,
     DEFAULT_MAX_RESULTS,
+    DEFAULT_SCRATCH_STORAGE_MODE,
     ERROR_CONFIGURATION_NAME_REQUIRES_VPC_MODE,
     ERROR_INVALID_CACHE_BEHAVIOR,
     ERROR_INVALID_NETWORKING_MODE,
+    ERROR_INVALID_OUTPUT_URI_PREFIX_MODE,
+    ERROR_INVALID_RUN_LOG_LEVEL,
     ERROR_INVALID_RUN_STATUS,
+    ERROR_INVALID_SCRATCH_STORAGE_MODE,
     ERROR_INVALID_STORAGE_TYPE,
     ERROR_STATIC_STORAGE_REQUIRES_CAPACITY,
     ERROR_VPC_MODE_REQUIRES_CONFIGURATION_NAME,
     NETWORKING_MODE_RESTRICTED,
     NETWORKING_MODE_VPC,
     NETWORKING_MODES,
+    OUTPUT_URI_PREFIX_MODE_SERVICE_DEFINED,
+    OUTPUT_URI_PREFIX_MODES,
+    RUN_LOG_LEVELS,
     RUN_STATUSES,
+    SCRATCH_STORAGE_MODES,
     STORAGE_TYPE_STATIC,
     STORAGE_TYPES,
 )
 from awslabs.aws_healthomics_mcp_server.utils.aws_utils import get_omics_client
 from awslabs.aws_healthomics_mcp_server.utils.error_utils import handle_tool_error
 from awslabs.aws_healthomics_mcp_server.utils.s3_utils import ensure_s3_uri_ends_with_slash
-from datetime import datetime
+from awslabs.aws_healthomics_mcp_server.utils.validation_utils import normalize_session_policy
+from datetime import datetime, timezone
 from loguru import logger
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 from pydantic import Field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 def parse_iso_datetime(iso_string: str) -> datetime:
@@ -48,21 +57,21 @@ def parse_iso_datetime(iso_string: str) -> datetime:
         iso_string: ISO format datetime string
 
     Returns:
-        datetime object
+        Timezone-aware datetime object; a string without an offset is treated as UTC
 
     Raises:
         ValueError: If the datetime string is invalid
     """
     try:
-        # Handle both with and without timezone info
+        # Python 3.10's fromisoformat does not accept a trailing 'Z'
         if iso_string.endswith('Z'):
             iso_string = iso_string[:-1] + '+00:00'
-        elif '+' not in iso_string and iso_string.count(':') == 2:
-            # Add timezone if missing
-            iso_string += '+00:00'
-        return datetime.fromisoformat(iso_string)
+        parsed = datetime.fromisoformat(iso_string)
     except ValueError as e:
         raise ValueError(f"Invalid datetime format '{iso_string}': {str(e)}")
+    # Assume UTC when no offset is given (e.g. '2024-01-01' or '2024-01-01T10:00'),
+    # so the result can be compared with the timezone-aware run creation times
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def filter_runs_by_creation_time(
@@ -177,6 +186,50 @@ async def start_run(
         None,
         description='Configuration name (required when networking_mode is VPC)',
     ),
+    scratch_storage_mode: Optional[str] = Field(
+        None,
+        description=(
+            'Scratch storage mode for the run. Allowed values: '
+            'LOCAL (mount local EBS ephemeral scratch storage at /tmp for CPU tasks) or '
+            'SHARED (use shared scratch storage). '
+            'Defaults to LOCAL when omitted (the MCP server default; note the HealthOmics '
+            'API default is SHARED).'
+        ),
+    ),
+    log_level: Optional[str] = Field(
+        None,
+        description=(
+            'Log level for the run. Allowed values: OFF, FATAL, ERROR, ALL. '
+            'Controls how much engine output (STDOUT/STDERR/Nextflow logs) is captured '
+            'to CloudWatch. When omitted, the HealthOmics API default applies. '
+            'Set to ALL to capture full engine logs for debugging.'
+        ),
+    ),
+    output_uri_prefix_mode: Optional[str] = Field(
+        None,
+        description=(
+            'Output path layout for the run. Allowed values: SERVICE_DEFINED, '
+            'NONE_WITH_OVERWRITE. SERVICE_DEFINED (the HealthOmics API default) writes '
+            'outputs under output_uri/<runId>/out/ and logs under output_uri/<runId>/logs/. '
+            'NONE_WITH_OVERWRITE writes outputs directly under output_uri with no run ID '
+            'folder, and logs under output_uri/logs/<runId>/. With NONE_WITH_OVERWRITE, a run into a URI that '
+            'already holds outputs overwrites files with the same name without warning. '
+            'Use a unique output_uri per run unless overwriting is intended. When omitted, '
+            'the HealthOmics API default applies.'
+        ),
+    ),
+    tags: Optional[Dict[str, str]] = Field(
+        None,
+        description='Optional tags (key-value pairs) to apply to the run',
+    ),
+    session_policy: Optional[Union[str, Dict[str, Any]]] = Field(
+        None,
+        description=(
+            'Optional inline IAM session policy (JSON string or object, max 2048 characters) '
+            'that scopes down the permissions of role_arn for this run. The effective '
+            'permissions are the intersection of the role policy and the session policy.'
+        ),
+    ),
     aws_profile: Optional[str] = Field(
         None,
         description='AWS profile name for this operation. Overrides the default credential chain.',
@@ -208,6 +261,17 @@ async def start_run(
         run_group_id: Optional ID of a run group to associate with this run
         networking_mode: Optional networking mode (RESTRICTED or VPC)
         configuration_name: Optional configuration name (required when networking_mode is VPC)
+        scratch_storage_mode: Optional scratch storage mode (LOCAL or SHARED); defaults to LOCAL
+        log_level: Optional log level for the run (OFF, FATAL, ERROR, or ALL).
+            Controls engine log capture to CloudWatch. Defaults to the HealthOmics API
+            default when omitted.
+        output_uri_prefix_mode: Optional output path layout (SERVICE_DEFINED or
+            NONE_WITH_OVERWRITE). NONE_WITH_OVERWRITE writes outputs directly under
+            output_uri and overwrites same-named files from earlier runs. Defaults to the
+            HealthOmics API default when omitted.
+        tags: Optional tags (key-value pairs) to apply to the run
+        session_policy: Optional inline IAM session policy (JSON string or dict) that
+            scopes down the permissions of role_arn for this run
         aws_profile: Optional AWS profile name override
         aws_region: Optional AWS region override
 
@@ -271,6 +335,62 @@ async def start_run(
             'Invalid networking configuration',
         )
 
+    # Resolve and validate scratch storage mode (MCP server defaults to LOCAL)
+    effective_scratch_storage_mode = (
+        scratch_storage_mode if scratch_storage_mode is not None else DEFAULT_SCRATCH_STORAGE_MODE
+    )
+
+    if effective_scratch_storage_mode not in SCRATCH_STORAGE_MODES:
+        return await handle_tool_error(
+            ctx,
+            ValueError(
+                ERROR_INVALID_SCRATCH_STORAGE_MODE.format(
+                    effective_scratch_storage_mode, SCRATCH_STORAGE_MODES
+                )
+            ),
+            'Invalid scratch storage mode',
+        )
+
+    # Normalize log_level: only treat a real string as provided (guards against an
+    # unresolved Field default leaking through when called outside the MCP framework)
+    effective_log_level = log_level if isinstance(log_level, str) else None
+
+    # Validate log level
+    if effective_log_level is not None and effective_log_level not in RUN_LOG_LEVELS:
+        return await handle_tool_error(
+            ctx,
+            ValueError(ERROR_INVALID_RUN_LOG_LEVEL.format(RUN_LOG_LEVELS)),
+            'Invalid log level',
+        )
+
+    # Normalize output_uri_prefix_mode the same way (guards against an unresolved Field default)
+    effective_output_uri_prefix_mode = (
+        output_uri_prefix_mode if isinstance(output_uri_prefix_mode, str) else None
+    )
+
+    if (
+        effective_output_uri_prefix_mode is not None
+        and effective_output_uri_prefix_mode not in OUTPUT_URI_PREFIX_MODES
+    ):
+        return await handle_tool_error(
+            ctx,
+            ValueError(
+                ERROR_INVALID_OUTPUT_URI_PREFIX_MODE.format(
+                    effective_output_uri_prefix_mode, OUTPUT_URI_PREFIX_MODES
+                )
+            ),
+            'Invalid output URI prefix mode',
+        )
+
+    # Normalize tags the same way (guards against an unresolved Field default)
+    effective_tags = tags if isinstance(tags, dict) else None
+
+    # Validate and serialize the session policy
+    try:
+        effective_session_policy = normalize_session_policy(session_policy)
+    except ValueError as e:
+        return await handle_tool_error(ctx, e, 'Invalid session policy')
+
     # Ensure output URI ends with a slash
     try:
         output_uri = ensure_s3_uri_ends_with_slash(output_uri)
@@ -286,6 +406,7 @@ async def start_run(
         'outputUri': output_uri,
         'parameters': parameters,
         'storageType': storage_type,
+        'scratchStorageMode': effective_scratch_storage_mode,
     }
 
     if workflow_version_name:
@@ -307,6 +428,20 @@ async def start_run(
         params['networkingMode'] = networking_mode
         params['configurationName'] = configuration_name
 
+    # Only set logLevel when provided, to preserve the HealthOmics API default otherwise
+    if effective_log_level is not None:
+        params['logLevel'] = effective_log_level
+
+    # Only set outputUriPrefixMode when provided, to preserve the HealthOmics API default otherwise
+    if effective_output_uri_prefix_mode is not None:
+        params['outputUriPrefixMode'] = effective_output_uri_prefix_mode
+
+    if effective_tags is not None:
+        params['tags'] = effective_tags
+
+    if effective_session_policy is not None:
+        params['sessionPolicy'] = effective_session_policy
+
     try:
         response = client.start_run(**params)
 
@@ -324,6 +459,10 @@ async def start_run(
             'networkingMode': networking_mode
             if networking_mode is not None
             else NETWORKING_MODE_RESTRICTED,
+            'scratchStorageMode': effective_scratch_storage_mode,
+            'logLevel': effective_log_level,
+            'outputUriPrefixMode': effective_output_uri_prefix_mode
+            or OUTPUT_URI_PREFIX_MODE_SERVICE_DEFINED,
         }
     except Exception as e:
         return await handle_tool_error(ctx, e, 'Error starting run')
@@ -485,14 +624,32 @@ async def list_runs(
 
             result = {'runs': result_runs}
 
-            # If we have more filtered results than max_results, we could implement
-            # a custom pagination token, but for simplicity we'll omit nextToken
-            # when client-side filtering is applied
-            if len(filtered_runs) > max_results:
-                logger.info(
-                    f'Client-side filtering returned {len(filtered_runs)} results, '
-                    f'truncated to {max_results}. Pagination not supported with date filters.'
-                )
+            # If the filtered set was truncated to max_results, signal that more
+            # matching runs may exist rather than silently returning a short page.
+            # The upstream token (if any) is a best-effort resume point, not a fully
+            # correct cursor: resuming with it fetches upstream pages after the
+            # batches already scanned, so it skips the excess matches that were
+            # already fetched into this batch but discarded here by truncation.
+            if len(filtered_runs) >= max_results:
+                if current_token:
+                    result['nextToken'] = current_token
+                    logger.info(
+                        f'Client-side filtering returned {len(filtered_runs)} results, '
+                        f'truncated to {max_results}. Returning upstream nextToken so '
+                        'the caller can continue pagination.'
+                    )
+                elif len(filtered_runs) > max_results:
+                    # Matching runs were discarded by the max_results slice above and
+                    # upstream is exhausted, so there is no token to hand back at all.
+                    # Raise the pagination.has_more flag the wrapper's nested-pagination
+                    # idiom already recognizes, so it reports this page as incomplete
+                    # instead of fabricating a COMPLETE result.
+                    result['pagination'] = {'has_more': True}
+                    logger.info(
+                        f'Client-side filtering returned {len(filtered_runs)} results, '
+                        f'truncated to {max_results}. No further upstream pages are '
+                        'available, so no nextToken can be issued for the remaining matches.'
+                    )
 
             return result
         else:
@@ -534,7 +691,8 @@ async def get_run(
         - Basic run information (id, arn, name, status)
         - Workflow information (workflowId, workflowType, workflowVersionName)
         - Timing information (creationTime, startTime, stopTime)
-        - Output locations (outputUri, runOutputUri)
+        - Output locations (outputUri, runOutputUri) and the output path layout
+          (outputUriPrefixMode), when the service returns it
         - IAM role (roleArn)
         - Run parameters and metadata
         - Status messages and failure reasons (if applicable)
@@ -571,7 +729,14 @@ async def get_run(
                 result[field] = response[field].isoformat()
 
         # Handle optional string fields
-        for field in ['statusMessage', 'failureReason', 'workflowVersionName']:
+        for field in [
+            'statusMessage',
+            'failureReason',
+            'workflowVersionName',
+            'scratchStorageMode',
+            'sessionPolicy',
+            'outputUriPrefixMode',
+        ]:
             if field in response:
                 result[field] = response[field]
 

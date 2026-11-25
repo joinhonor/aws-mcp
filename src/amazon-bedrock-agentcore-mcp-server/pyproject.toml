@@ -2,16 +2,17 @@
 name = "awslabs.amazon-bedrock-agentcore-mcp-server"
 
 # NOTE: "Patch"=9223372036854775807 bumps next release to zero.
-version = "0.1.1"
+version = "0.2.2"
 
 description = "Model Context Protocol (MCP) server for Amazon Bedrock AgentCore services"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "loguru>=0.7.0",
-    "mcp[cli]>=1.23.0",
+    "mcp[cli]>=2.0.0,<3.0.0",
     "pydantic>=2.10.6",
     "bedrock-agentcore>=1.1.0,<2.0.0",
+    "boto3>=1.43.127",
     "playwright>=1.40.0",
 ]
 license = {text = "Apache-2.0"}
@@ -45,7 +46,7 @@ changelog = "https://github.com/awslabs/mcp/blob/main/src/amazon-bedrock-agentco
 [dependency-groups]
 dev = [
     "commitizen>=4.2.2",
-    "pre-commit>=4.1.0",
+    "pre-commit>=4.1.0; python_version >= '3.11'",
     "ruff>=0.9.7",
     "pyright>=1.1.398",
     "pytest>=8.0.0",

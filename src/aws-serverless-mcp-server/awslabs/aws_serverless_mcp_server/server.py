@@ -59,14 +59,14 @@ from awslabs.aws_serverless_mcp_server.tools.webapps import (
 from awslabs.aws_serverless_mcp_server.utils.aws_client_helper import get_aws_client
 from awslabs.aws_serverless_mcp_server.utils.const import AWS_REGION, DEPLOYMENT_STATUS_DIR
 from loguru import logger
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from typing import Any, Dict
 
 
 # Initialize boto3 client
 schemas_client = get_aws_client('schemas', AWS_REGION)
 
-mcp = FastMCP(
+mcp = MCPServer(
     'awslabs.aws-serverless-mcp-server',
     instructions="""AWS Serverless MCP
 
@@ -123,7 +123,7 @@ mcp = FastMCP(
 
     ## Usage Notes
     - By default, the server runs in read-only mode. Use the `--allow-write` flag to enable write operations and public resource creation.
-    - Access to sensitive data (Lambda function and API GW logs) requires the `--allow-sensitive-data-access` flag.
+    - The `--allow-sensitive-data-access` flag enables `sam_logs`, which returns CloudWatch logs for a stack's Lambda functions, API Gateway APIs and Step Functions state machines, and for any log group passed in `cw_log_group`. Without the flag, `sam_logs` returns an error. The flag doesn't apply to `sam_local_invoke`, which always returns the output and logs of the local invocation.
 
     ## Prerequisites
     1. Have an AWS account
@@ -287,7 +287,7 @@ def main() -> int:
     Returns:
         int: Exit code (0 for success, non-zero for failure)
     """
-    os.makedirs(DEPLOYMENT_STATUS_DIR, exist_ok=True)
+    os.makedirs(DEPLOYMENT_STATUS_DIR, mode=0o700, exist_ok=True)
     logger.remove()
     logger.add(sys.stderr, level=os.getenv('FASTMCP_LOG_LEVEL', 'WARNING'))
 
@@ -298,7 +298,11 @@ def main() -> int:
     parser.add_argument(
         '--allow-sensitive-data-access',
         action='store_true',
-        help='Returns sensitive data from tools (e.g. logs, environment variables)',
+        help=(
+            'Enables sam_logs, which returns CloudWatch logs for stack resources and for '
+            'any log group passed in cw_log_group. Does not apply to sam_local_invoke, '
+            'which always returns the output and logs of the local invocation.'
+        ),
     )
 
     args = parser.parse_args()

@@ -16,7 +16,89 @@
 
 from datetime import datetime
 from pydantic import BaseModel, Field
-from typing import Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional, TypeVar
+
+
+RedshiftDataModelT = TypeVar('RedshiftDataModelT', bound='RedshiftDataModel')
+
+
+class ClusterKey(NamedTuple):
+    """A cluster's identifier and type: the key of everything this server holds per cluster.
+
+    That is open transactions, the per-target cap and the batch-denial latch. The type is part of
+    it because the two AWS namespaces are separate, so a provisioned cluster and a workgroup can
+    share a name.
+
+    A tuple rather than a joined string, like `Target` and the transaction key: joined with a
+    separator, a database or transaction name containing it made two keys equal.
+    """
+
+    identifier: str
+    type: str
+
+    def __str__(self) -> str:
+        """Show it in errors and the log as `<identifier> (<type>)`.
+
+        Not as `<type>:<identifier>`, which looks like an identifier to pass back.
+        """
+        return f'{self.identifier} ({self.type})'
+
+
+class Target(NamedTuple):
+    """A cluster and a database: where a statement runs, and what the transaction cap counts."""
+
+    cluster: ClusterKey
+    database: str
+
+    def __str__(self) -> str:
+        """Show it as `<cluster>:<database>`."""
+        return f'{self.cluster}:{self.database}'
+
+
+class RedshiftDataModel(BaseModel):
+    """Base for models built from a Redshift Data API result set.
+
+    Subclasses declare their fields named to match the SHOW result columns.
+    `from_redshift_response` maps result columns to those fields by name, so
+    parsing is independent of column order; unknown columns are ignored.
+    """
+
+    @staticmethod
+    def cell_value(cell: dict) -> Any:
+        """Unwrap a single Redshift Data API result cell to a Python scalar.
+
+        Every member is read to a scalar, because a value that is not one does not survive the
+        trip out: this server's models declare scalar fields, and the MCP layer serializes
+        `bytes` by decoding it as UTF-8 - which silently turns a blob into a string that cannot
+        be told from a real one, and raises UnicodeDecodeError past this server's error handling
+        when it is not decodable.
+        """
+        if cell.get('isNull'):
+            return None
+        blob = cell.get('blobValue')
+        if blob is not None:
+            # Hex, to keep it a scalar. A member the API defines, though Redshift sends VARBYTE,
+            # GEOMETRY and GEOGRAPHY as base64 in `stringValue`, which arrives unchanged.
+            return blob.hex()
+        for key in ('stringValue', 'longValue', 'doubleValue', 'booleanValue'):
+            if key in cell:
+                return cell[key]
+        # A member this does not know, which botocore hands over as
+        # `{'SDK_UNKNOWN_MEMBER': {'name': ...}}` and whose value it has already discarded. The
+        # name of it is all there is to report, and it is reported as the string every other
+        # unrecognized value is.
+        return str(cell)
+
+    @classmethod
+    def from_redshift_response(
+        cls: type[RedshiftDataModelT], results_response: dict
+    ) -> list[RedshiftDataModelT]:
+        """Build a list of model instances from a Data API result set."""
+        names = [col.get('name') for col in results_response.get('ColumnMetadata', [])]
+        return [
+            cls.model_validate({name: cls.cell_value(cell) for name, cell in zip(names, record)})
+            for record in results_response.get('Records', [])
+        ]
 
 
 class RedshiftCluster(BaseModel):
@@ -39,33 +121,34 @@ class RedshiftCluster(BaseModel):
         default_factory=dict, description='Tags associated with the cluster'
     )
 
+    @property
+    def key(self) -> ClusterKey:
+        """This cluster as everything keyed per cluster names it."""
+        return ClusterKey(self.identifier, self.type)
 
-class RedshiftDatabase(BaseModel):
-    """Information about a database in a Redshift cluster.
 
-    Based on the SVV_REDSHIFT_DATABASES system view.
-    """
+class RedshiftDatabase(RedshiftDataModel):
+    """Information about a database in a Redshift cluster."""
 
     database_name: str = Field(..., description='The name of the database')
     database_owner: Optional[int] = Field(None, description='The database owner user ID')
     database_type: Optional[str] = Field(
-        None, description='The type of database (local or shared)'
+        None,
+        description="The type of database: 'local' on the cluster itself, 'shared' from a "
+        "datashare, or 'auto mounted catalog' mounted from an external catalog such as AWS Glue",
     )
     database_acl: Optional[str] = Field(
         None, description='Access control information (for internal use)'
     )
-    database_options: Optional[str] = Field(None, description='The properties of the database')
+    parameters: Optional[str] = Field(None, description='The properties of the database')
     database_isolation_level: Optional[str] = Field(
         None,
         description='The isolation level of the database (Snapshot Isolation or Serializable)',
     )
 
 
-class RedshiftSchema(BaseModel):
-    """Information about a schema in a Redshift database.
-
-    Based on the SVV_ALL_SCHEMAS system view.
-    """
+class RedshiftSchema(RedshiftDataModel):
+    """Information about a schema in a Redshift database."""
 
     database_name: str = Field(..., description='The name of the database where the schema exists')
     schema_name: str = Field(..., description='The name of the schema')
@@ -84,11 +167,8 @@ class RedshiftSchema(BaseModel):
     )
 
 
-class RedshiftTable(BaseModel):
-    """Information about a table in a Redshift database.
-
-    Based on the SVV_ALL_TABLES system view.
-    """
+class RedshiftTable(RedshiftDataModel):
+    """Information about a table in a Redshift database."""
 
     database_name: str = Field(..., description='The name of the database where the table exists')
     schema_name: str = Field(..., description='The schema name for the table')
@@ -103,11 +183,8 @@ class RedshiftTable(BaseModel):
     remarks: Optional[str] = Field(None, description='Remarks about the table')
 
 
-class RedshiftColumn(BaseModel):
-    """Information about a column in a Redshift table.
-
-    Based on the SVV_ALL_COLUMNS system view.
-    """
+class RedshiftColumn(RedshiftDataModel):
+    """Information about a column in a Redshift table."""
 
     database_name: str = Field(..., description='The name of the database')
     schema_name: str = Field(..., description='The name of the schema')
@@ -135,7 +212,4 @@ class QueryResult(BaseModel):
     columns: list[str] = Field(..., description='List of column names in the result set')
     rows: list[list] = Field(..., description='List of rows, where each row is a list of values')
     row_count: int = Field(..., description='Number of rows returned')
-    execution_time_ms: Optional[int] = Field(
-        None, description='Query execution time in milliseconds'
-    )
     query_id: str = Field(..., description='Unique identifier for the query execution')

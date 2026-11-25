@@ -41,10 +41,12 @@ from awslabs.timestream_for_influxdb_mcp_server.server import (
     list_db_instances_for_cluster,
     list_db_parameter_groups,
     list_tags_for_resource,
+    mask_flux_comments_and_strings,
     tag_resource,
     untag_resource,
     update_db_cluster,
     update_db_instance,
+    validate_flux_query,
 )
 from unittest.mock import MagicMock, patch
 
@@ -85,6 +87,10 @@ class TestClientCreation:
         assert 'Connection error' in str(excinfo.value)
 
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.InfluxDBClient')
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+        'https://influxdb-example.aws:8086',
+    )
     def test_get_influxdb_client_happy_path(self, mock_influxdb_client):
         """Test get_influxdb_client function with valid parameters."""
         # Arrange
@@ -123,10 +129,29 @@ class TestClientCreation:
 
     def test_get_influxdb_client_missing_token(self):
         """Test get_influxdb_client when token is missing."""
-        with pytest.raises(ValueError) as excinfo:
-            get_influxdb_client(url='https://example.com', token=None, org='test-org')
+        with patch(
+            'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+            'https://example.com',
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                get_influxdb_client(url='https://example.com', token=None, org='test-org')
 
         assert 'Token must be provided' in str(excinfo.value)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS', '')
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL', None)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.InfluxDBClient')
+    def test_get_influxdb_client_rejects_unapproved_url(self, mock_influxdb_client):
+        """Test that the client factory fails closed for unapproved destinations."""
+        with pytest.raises(ValueError) as excinfo:
+            get_influxdb_client(
+                url='http://169.254.169.254',
+                token='caller-token',
+                org='caller-org',
+            )
+
+        assert 'not approved by the server operator' in str(excinfo.value)
+        mock_influxdb_client.assert_not_called()
 
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.boto3')
     @patch.dict('os.environ', {'AWS_PROFILE': 'test-profile', 'AWS_REGION': 'us-west-2'})
@@ -179,7 +204,6 @@ class TestDbClusterOperations:
             vpc_security_group_ids=vpc_security_group_ids,
             vpc_subnet_ids=vpc_subnet_ids,
             tags=tags,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -214,8 +238,10 @@ class TestDbClusterOperations:
         assert result == {'dbClusterId': 'test-cluster-id'}
 
     @pytest.mark.asyncio
-    async def test_create_db_cluster_read_only_mode(self):
+    async def test_create_db_cluster_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Test parameters
         name = 'test-cluster'
         db_instance_type = 'db.influx.large'
@@ -232,12 +258,8 @@ class TestDbClusterOperations:
                 allocated_storage_gb=allocated_storage_gb,
                 vpc_security_group_ids=vpc_security_group_ids,
                 vpc_subnet_ids=vpc_subnet_ids,
-                tool_write_mode=False,
             )
-        assert (
-            'CreateDbCluster tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'CreateDbCluster is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -268,7 +290,6 @@ class TestDbClusterOperations:
                 allocated_storage_gb=allocated_storage_gb,
                 vpc_security_group_ids=vpc_security_group_ids,
                 vpc_subnet_ids=vpc_subnet_ids,
-                tool_write_mode=True,
             )
 
         # Check if the exception is a ClientError with ValidationException code
@@ -332,7 +353,7 @@ class TestDbClusterOperations:
         }
 
         # Act
-        result = await delete_db_cluster(db_cluster_id='test-cluster-id', tool_write_mode=True)
+        result = await delete_db_cluster(db_cluster_id='test-cluster-id')
 
         # Assert
         mock_get_client.assert_called_once()
@@ -340,17 +361,16 @@ class TestDbClusterOperations:
         assert result == {'dbClusterId': 'test-cluster-id', 'dbClusterStatus': 'deleting'}
 
     @pytest.mark.asyncio
-    async def test_delete_db_cluster_read_only_mode(self):
+    async def test_delete_db_cluster_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Act
         with pytest.raises(Exception) as excinfo:
-            await delete_db_cluster(db_cluster_id='test-cluster-id', tool_write_mode=False)
+            await delete_db_cluster(db_cluster_id='test-cluster-id')
 
         # Assert
-        assert (
-            'DeleteDbCluster tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'DeleteDbCluster is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -371,7 +391,7 @@ class TestDbClusterOperations:
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await delete_db_cluster(db_cluster_id='cluster-with-instances', tool_write_mode=True)
+            await delete_db_cluster(db_cluster_id='cluster-with-instances')
 
         assert 'InvalidDBClusterState' in str(excinfo.value)
         mock_get_client.assert_called_once()
@@ -450,7 +470,6 @@ class TestDbClusterOperations:
             db_instance_type=db_instance_type,
             port=port,
             failover_mode=failover_mode,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -468,8 +487,10 @@ class TestDbClusterOperations:
         }
 
     @pytest.mark.asyncio
-    async def test_update_db_cluster_read_only_mode(self):
+    async def test_update_db_cluster_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         db_cluster_id = 'cluster-in-use'
         db_instance_type = 'db.influx.xlarge'
 
@@ -478,14 +499,10 @@ class TestDbClusterOperations:
             await update_db_cluster(
                 db_cluster_id=db_cluster_id,
                 db_instance_type=db_instance_type,
-                tool_write_mode=False,
             )
 
         # Assert
-        assert (
-            'UpdateDbCluster tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'UpdateDbCluster is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -512,7 +529,6 @@ class TestDbClusterOperations:
             await update_db_cluster(
                 db_cluster_id=db_cluster_id,
                 db_instance_type=db_instance_type,
-                tool_write_mode=True,
             )
 
         assert 'InvalidDBClusterState' in str(excinfo.value)
@@ -598,7 +614,6 @@ class TestDbClusterOperations:
                 vpc_security_group_ids=['sg-12345'],
                 vpc_subnet_ids=['subnet-12345', 'subnet-67890'],
                 tags=None,
-                tool_write_mode=True,
             )
 
         assert 'AWS API error' in str(excinfo.value)
@@ -630,7 +645,6 @@ class TestDbClusterOperations:
             failover_mode='AUTOMATIC',
             tags=None,
             log_delivery_configuration={'s3Configuration': {'bucketName': 'logs-bucket'}},
-            tool_write_mode=True,
         )
 
         mock_client.create_db_cluster.assert_called_once()
@@ -662,7 +676,6 @@ class TestDbClusterOperations:
             db_cluster_id='test-cluster-id',
             db_parameter_group_identifier='param-group-1',
             log_delivery_configuration={'s3Configuration': {'bucketName': 'logs-bucket'}},
-            tool_write_mode=True,
         )
 
         mock_client.update_db_cluster.assert_called_once()
@@ -702,7 +715,6 @@ class TestDbInstanceOperations:
             vpc_security_group_ids=vpc_security_group_ids,
             vpc_subnet_ids=vpc_subnet_ids,
             tags=tags,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -737,8 +749,10 @@ class TestDbInstanceOperations:
         assert result == {'dbInstanceId': 'test-instance-id'}
 
     @pytest.mark.asyncio
-    async def test_create_db_instance_read_only_mode(self):
+    async def test_create_db_instance_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Test parameters
         db_instance_name = 'test-instance'
         db_instance_type = 'db.influx.large'
@@ -756,12 +770,8 @@ class TestDbInstanceOperations:
                 allocated_storage_gb=allocated_storage_gb,
                 vpc_security_group_ids=vpc_security_group_ids,
                 vpc_subnet_ids=vpc_subnet_ids,
-                tool_write_mode=False,
             )
-        assert (
-            'CreateDbInstance tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'CreateDbInstance is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.create_db_instance')
@@ -790,7 +800,6 @@ class TestDbInstanceOperations:
                 allocated_storage_gb=allocated_storage_gb,
                 vpc_security_group_ids=vpc_security_group_ids,
                 vpc_subnet_ids=vpc_subnet_ids,
-                tool_write_mode=True,
             )
 
         # Check if the exception is a ClientError with ResourceLimitExceeded code
@@ -854,7 +863,7 @@ class TestDbInstanceOperations:
         }
 
         # Act
-        result = await delete_db_instance(identifier='test-instance-id', tool_write_mode=True)
+        result = await delete_db_instance(identifier='test-instance-id')
 
         # Assert
         mock_get_client.assert_called_once()
@@ -862,16 +871,15 @@ class TestDbInstanceOperations:
         assert result == {'id': 'test-instance-id', 'status': 'deleting'}
 
     @pytest.mark.asyncio
-    async def test_delete_db_instance_read_only_mode(self):
+    async def test_delete_db_instance_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await delete_db_instance(identifier='instance-in-use', tool_write_mode=False)
+            await delete_db_instance(identifier='instance-in-use')
 
-        assert (
-            'DeleteDbInstance tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'DeleteDbInstance is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -892,7 +900,7 @@ class TestDbInstanceOperations:
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await delete_db_instance(identifier='instance-in-use', tool_write_mode=True)
+            await delete_db_instance(identifier='instance-in-use')
 
         assert 'InvalidDBInstanceState' in str(excinfo.value)
         mock_get_client.assert_called_once()
@@ -1014,7 +1022,6 @@ class TestDbInstanceOperations:
             db_instance_type=db_instance_type,
             allocated_storage_gb=allocated_storage_gb,
             port=port,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -1033,21 +1040,18 @@ class TestDbInstanceOperations:
         }
 
     @pytest.mark.asyncio
-    async def test_update_db_instance_read_only_mode(self):
+    async def test_update_db_instance_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         identifier = 'instance-in-use'
         db_instance_type = 'db.influx.xlarge'
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await update_db_instance(
-                identifier=identifier, db_instance_type=db_instance_type, tool_write_mode=False
-            )
+            await update_db_instance(identifier=identifier, db_instance_type=db_instance_type)
 
-        assert (
-            'UpdateDbInstance tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'UpdateDbInstance is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -1071,9 +1075,7 @@ class TestDbInstanceOperations:
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await update_db_instance(
-                identifier=identifier, db_instance_type=db_instance_type, tool_write_mode=True
-            )
+            await update_db_instance(identifier=identifier, db_instance_type=db_instance_type)
 
         assert 'InvalidDBInstanceState' in str(excinfo.value)
         mock_get_client.assert_called_once()
@@ -1158,7 +1160,6 @@ class TestDbInstanceOperations:
                 vpc_security_group_ids=['sg-12345'],
                 vpc_subnet_ids=['subnet-12345', 'subnet-67890'],
                 tags=None,
-                tool_write_mode=True,
             )
 
         assert 'AWS API error' in str(excinfo.value)
@@ -1188,7 +1189,6 @@ class TestDbInstanceOperations:
             port=8086,
             db_parameter_group_id='param-group-1',
             tags=None,
-            tool_write_mode=True,
         )
 
         mock_client.create_db_instance.assert_called_once()
@@ -1220,7 +1220,6 @@ class TestDbInstanceOperations:
             db_storage_type='InfluxIOIncludedT1',
             deployment_type='WITH_MULTIAZ_STANDBY',
             log_delivery_configuration={'s3Configuration': {'bucketName': 'logs-bucket'}},
-            tool_write_mode=True,
         )
 
         mock_client.update_db_instance.assert_called_once()
@@ -1281,7 +1280,6 @@ class TestParameterGroupOperations:
             description=description,
             parameters=parameters,
             tags=tags,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -1300,21 +1298,18 @@ class TestParameterGroupOperations:
         }
 
     @pytest.mark.asyncio
-    async def test_create_db_parameter_group_read_only_mode(self):
+    async def test_create_db_parameter_group_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         name = 'existing-param-group'
         description = 'Test parameter group'
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await create_db_parameter_group(
-                name=name, description=description, tool_write_mode=False
-            )
+            await create_db_parameter_group(name=name, description=description)
 
-        assert (
-            'CreateDbParamGroup tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'CreateDbParamGroup is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.create_db_parameter_group')
@@ -1336,7 +1331,7 @@ class TestParameterGroupOperations:
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await mock_create(name=name, description=description, tool_write_mode=True)
+            await mock_create(name=name, description=description)
 
         # Check if the exception is a ClientError with DBParameterGroupAlreadyExists code
         if isinstance(excinfo.value, botocore.exceptions.ClientError):
@@ -1460,7 +1455,6 @@ class TestParameterGroupOperations:
             await create_db_parameter_group(
                 name='test-param-group',
                 tags=None,
-                tool_write_mode=True,
             )
 
         assert 'AWS API error' in str(excinfo.value)
@@ -1533,7 +1527,7 @@ class TestTagOperations:
         tags = {'Environment': 'Production', 'Owner': 'DataTeam'}
 
         # Act
-        result = await tag_resource(resource_arn=resource_arn, tags=tags, tool_write_mode=True)
+        result = await tag_resource(resource_arn=resource_arn, tags=tags)
 
         # Assert
         mock_get_client.assert_called_once()
@@ -1546,20 +1540,19 @@ class TestTagOperations:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_tag_resource_read_only_mode(self):
+    async def test_tag_resource_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Arrange
         resource_arn = 'arn:aws:timestream-influxdb:us-east-1:123456789012:db/non-existent-db'
         tags = {'Environment': 'Production'}
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await tag_resource(resource_arn=resource_arn, tags=tags, tool_write_mode=False)
+            await tag_resource(resource_arn=resource_arn, tags=tags)
 
-        assert (
-            'TagResource tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'TagResource is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -1578,7 +1571,7 @@ class TestTagOperations:
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await tag_resource(resource_arn=resource_arn, tags=tags, tool_write_mode=True)
+            await tag_resource(resource_arn=resource_arn, tags=tags)
 
         assert 'ResourceNotFoundException' in str(excinfo.value)
         mock_get_client.assert_called_once()
@@ -1597,9 +1590,7 @@ class TestTagOperations:
         tag_keys = ['Environment', 'Owner']
 
         # Act
-        result = await untag_resource(
-            resource_arn=resource_arn, tag_keys=tag_keys, tool_write_mode=True
-        )
+        result = await untag_resource(resource_arn=resource_arn, tag_keys=tag_keys)
 
         # Assert
         mock_get_client.assert_called_once()
@@ -1609,22 +1600,19 @@ class TestTagOperations:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_untag_resource_read_only_mode(self):
+    async def test_untag_resource_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Arrange
         resource_arn = 'arn:aws:timestream-influxdb:us-east-1:123456789012:db/non-existent-db'
         tag_keys = ['Environment']
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await untag_resource(
-                resource_arn=resource_arn, tag_keys=tag_keys, tool_write_mode=False
-            )
+            await untag_resource(resource_arn=resource_arn, tag_keys=tag_keys)
 
-        assert (
-            'UntagResource tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'UntagResource is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_timestream_influxdb_client')
@@ -1643,9 +1631,7 @@ class TestTagOperations:
 
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
-            await untag_resource(
-                resource_arn=resource_arn, tag_keys=tag_keys, tool_write_mode=True
-            )
+            await untag_resource(resource_arn=resource_arn, tag_keys=tag_keys)
 
         assert 'ResourceNotFoundException' in str(excinfo.value)
         mock_get_client.assert_called_once()
@@ -1654,6 +1640,10 @@ class TestTagOperations:
         )
 
 
+@patch(
+    'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+    'https://influxdb-example.aws:8086',
+)
 class TestInfluxDBOperations:
     """Tests for InfluxDB operations."""
 
@@ -1689,7 +1679,6 @@ class TestInfluxDBOperations:
             time_precision='ns',
             sync_mode='synchronous',
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -1701,8 +1690,10 @@ class TestInfluxDBOperations:
         assert result['status'] == 'success'
 
     @pytest.mark.asyncio
-    async def test_influxdb_write_points_read_only_mode(self):
+    async def test_influxdb_write_points_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         url = 'https://influxdb-example.aws:8086'
         token = 'test-token'
         bucket = 'test-bucket'
@@ -1726,14 +1717,10 @@ class TestInfluxDBOperations:
                 time_precision='ns',
                 sync_mode='synchronous',
                 verify_ssl=True,
-                tool_write_mode=False,
             )
 
         # Assert
-        assert (
-            'InfluxDBWritePoints tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'InfluxDBWritePoints is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
@@ -1768,7 +1755,6 @@ class TestInfluxDBOperations:
             time_precision='ns',
             sync_mode='synchronous',
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -1803,7 +1789,6 @@ class TestInfluxDBOperations:
             data_line_protocol=data_line_protocol,
             time_precision='ns',
             sync_mode='synchronous',
-            tool_write_mode=True,
         )
 
         # Assert
@@ -1814,8 +1799,10 @@ class TestInfluxDBOperations:
         assert result['status'] == 'success'
 
     @pytest.mark.asyncio
-    async def test_influxdb_write_line_protocol_read_only_mode(self):
+    async def test_influxdb_write_line_protocol_read_only_mode(self, monkeypatch):
         """Test tool in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         url = 'https://influxdb-example.aws:8086'
         token = 'test-token'
         bucket = 'test-bucket'
@@ -1832,13 +1819,11 @@ class TestInfluxDBOperations:
                 data_line_protocol=data_line_protocol,
                 time_precision='ns',
                 sync_mode='synchronous',
-                tool_write_mode=False,
             )
 
         # Assert
-        assert (
-            'InfluxDBWriteLineProtocol tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
+        assert 'InfluxDBWriteLineProtocol is a write operation and is disabled' in str(
+            excinfo.value
         )
 
     @pytest.mark.asyncio
@@ -1867,7 +1852,6 @@ class TestInfluxDBOperations:
             data_line_protocol=data_line_protocol,
             time_precision='ns',
             sync_mode='synchronous',
-            tool_write_mode=True,
         )
 
         # Assert
@@ -2052,7 +2036,6 @@ class TestInfluxDBOperations:
             retention_seconds=None,
             description=None,
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -2065,8 +2048,10 @@ class TestInfluxDBOperations:
         assert result['bucket']['name'] == 'new-bucket'
 
     @pytest.mark.asyncio
-    async def test_influxdb_create_bucket_read_only_mode(self):
+    async def test_influxdb_create_bucket_read_only_mode(self, monkeypatch):
         """Test influxdb_create_bucket in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
             await influxdb_create_bucket(
@@ -2076,13 +2061,9 @@ class TestInfluxDBOperations:
                 org='test-org',
                 retention_seconds=None,
                 description=None,
-                tool_write_mode=False,
             )
 
-        assert (
-            'InfluxDBCreateBucket tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'InfluxDBCreateBucket is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
@@ -2108,7 +2089,6 @@ class TestInfluxDBOperations:
             retention_seconds=None,
             description=None,
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -2197,7 +2177,6 @@ class TestInfluxDBOperations:
             url=url,
             token=token,
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -2209,21 +2188,19 @@ class TestInfluxDBOperations:
         assert result['organization']['name'] == 'new-org'
 
     @pytest.mark.asyncio
-    async def test_influxdb_create_org_read_only_mode(self):
+    async def test_influxdb_create_org_read_only_mode(self, monkeypatch):
         """Test influxdb_create_org in read-only mode."""
+        # Operator write gate disabled: mutating tools must be refused.
+        monkeypatch.setattr('awslabs.timestream_for_influxdb_mcp_server.server.ALLOW_WRITE', False)
         # Act & Assert
         with pytest.raises(Exception) as excinfo:
             await influxdb_create_org(
                 org_name='new-org',
                 url='https://influxdb-example.aws:8086',
                 token='test-token',
-                tool_write_mode=False,
             )
 
-        assert (
-            'InfluxDBCreateOrg tool invocation not allowed when tool-write-mode is set to False'
-            in str(excinfo.value)
-        )
+        assert 'InfluxDBCreateOrg is a write operation and is disabled' in str(excinfo.value)
 
     @pytest.mark.asyncio
     @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
@@ -2245,7 +2222,6 @@ class TestInfluxDBOperations:
             url=url,
             token=token,
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         # Assert
@@ -2277,11 +2253,29 @@ class TestInfluxDBOperations:
             time_precision='ns',
             sync_mode='synchronous',
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         mock_write_api.write.assert_called_once()
         assert result['status'] == 'success'
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS', '')
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL', None)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_influxdb_query_rejects_unapproved_url_before_client_creation(
+        self, mock_get_client
+    ):
+        """Test that an unapproved URL never reaches the InfluxDB client."""
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='http://169.254.169.254',
+                token='caller-token',
+                org='caller-org',
+                query='from(bucket: "test")',
+            )
+
+        assert 'not approved by the server operator' in str(excinfo.value)
+        mock_get_client.assert_not_called()
 
 
 class TestResolveInfluxDBConfig:
@@ -2294,7 +2288,7 @@ class TestResolveInfluxDBConfig:
         with pytest.raises(ValueError) as excinfo:
             resolve_influxdb_config(url=None, token='test-token', org='test-org')
 
-        assert 'URL must be provided' in str(excinfo.value)
+        assert 'url is required' in str(excinfo.value)
 
     def test_resolve_influxdb_config_missing_token(self):
         """Test resolve_influxdb_config when token is missing."""
@@ -2303,7 +2297,7 @@ class TestResolveInfluxDBConfig:
         with pytest.raises(ValueError) as excinfo:
             resolve_influxdb_config(url='https://example.com', token=None, org='test-org')
 
-        assert 'Token must be provided' in str(excinfo.value)
+        assert 'token is required' in str(excinfo.value)
 
     def test_resolve_influxdb_config_missing_org_when_required(self):
         """Test resolve_influxdb_config when org is missing and required."""
@@ -2314,8 +2308,12 @@ class TestResolveInfluxDBConfig:
                 url='https://example.com', token='test-token', org=None, require_org=True
             )
 
-        assert 'Organization must be provided' in str(excinfo.value)
+        assert 'org is required' in str(excinfo.value)
 
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+        'https://example.com',
+    )
     def test_resolve_influxdb_config_org_not_required(self):
         """Test resolve_influxdb_config when org is not required."""
         from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
@@ -2328,7 +2326,199 @@ class TestResolveInfluxDBConfig:
         assert token == 'test-token'
         assert org is None
 
+    def test_resolve_rejects_custom_url_without_token(self):
+        """Test that providing a custom URL without a token is rejected (SSRF prevention)."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
 
+        with pytest.raises(ValueError) as excinfo:
+            resolve_influxdb_config(url='https://evil.example.com', token=None, org=None)
+
+        assert 'token is required' in str(excinfo.value)
+        assert 'Server credentials cannot be mixed' in str(excinfo.value)
+
+    def test_resolve_rejects_custom_token_without_url(self):
+        """Test that providing a custom token without a URL is rejected (mixed trust prevention)."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        with pytest.raises(ValueError) as excinfo:
+            resolve_influxdb_config(url=None, token='attacker-token', org=None)
+
+        assert 'url is required' in str(excinfo.value)
+        assert 'Server credentials cannot be mixed' in str(excinfo.value)
+
+    def test_resolve_rejects_custom_org_without_url_and_token(self):
+        """Test that providing only a custom org is rejected (mixed trust prevention)."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        with pytest.raises(ValueError) as excinfo:
+            resolve_influxdb_config(url=None, token=None, org='attacker-org')
+
+        assert 'url is required' in str(excinfo.value)
+        assert 'Server credentials cannot be mixed' in str(excinfo.value)
+
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+        'https://custom.example.com',
+    )
+    def test_resolve_accepts_all_caller_supplied_params(self):
+        """Test that providing all custom params works correctly."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        url, token, org = resolve_influxdb_config(
+            url='https://custom.example.com', token='custom-token', org='custom-org'
+        )
+
+        assert url == 'https://custom.example.com'
+        assert token == 'custom-token'
+        assert org == 'custom-org'
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS', '')
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL',
+        'https://trusted.example.com',
+    )
+    def test_resolve_rejects_complete_config_for_unapproved_url(self):
+        """Test that complete caller credentials do not bypass URL approval."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        with pytest.raises(ValueError) as excinfo:
+            resolve_influxdb_config(
+                url='http://169.254.169.254',
+                token='caller-token',
+                org='caller-org',
+            )
+
+        assert 'not approved by the server operator' in str(excinfo.value)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS', '')
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL',
+        'https://trusted.example.com/',
+    )
+    def test_resolve_accepts_configured_url_override(self):
+        """Test that INFLUXDB_URL is automatically approved for caller credentials."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        url, token, org = resolve_influxdb_config(
+            url='https://TRUSTED.example.com',
+            token='caller-token',
+            org='caller-org',
+        )
+
+        assert url == 'https://trusted.example.com'
+        assert token == 'caller-token'
+        assert org == 'caller-org'
+
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+        'https://first.example.com, http://10.0.0.8:8086/',
+    )
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL', None)
+    def test_resolve_accepts_operator_approved_private_url(self):
+        """Test that operators can explicitly approve a private InfluxDB endpoint."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        url, _, _ = resolve_influxdb_config(
+            url='http://10.0.0.8:8086',
+            token='caller-token',
+            org='caller-org',
+        )
+
+        assert url == 'http://10.0.0.8:8086'
+
+    @pytest.mark.parametrize(
+        'url',
+        [
+            'https://user@example.com',
+            'https://example.com?target=internal',
+            'https://example.com#fragment',
+            'https://example.com:invalid',
+        ],
+    )
+    def test_resolve_rejects_ambiguous_urls(self, url):
+        """Test that URL forms unsuitable for strict allowlist comparison are rejected."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        with pytest.raises(ValueError):
+            resolve_influxdb_config(url=url, token='caller-token', org='caller-org')
+
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL', 'https://env.example.com'
+    )
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_TOKEN', 'env-token')
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ORG', 'env-org')
+    def test_resolve_uses_env_vars_when_no_caller_params(self):
+        """Test that env vars are used when no caller params are provided."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        url, token, org = resolve_influxdb_config()
+
+        assert url == 'https://env.example.com'
+        assert token == 'env-token'
+        assert org == 'env-org'
+
+    @pytest.mark.parametrize(
+        ('url', 'token', 'org', 'expected_message'),
+        [
+            (None, 'env-token', 'env-org', 'URL must be provided'),
+            ('https://env.example.com', None, 'env-org', 'Token must be provided'),
+            ('https://env.example.com', 'env-token', None, 'Organization must be provided'),
+        ],
+    )
+    def test_resolve_rejects_incomplete_environment_configuration(
+        self, monkeypatch, url, token, org, expected_message
+    ):
+        """Test that every environment connection field is required."""
+        from awslabs.timestream_for_influxdb_mcp_server import server
+
+        monkeypatch.setattr(server, 'INFLUXDB_URL', url)
+        monkeypatch.setattr(server, 'INFLUXDB_TOKEN', token)
+        monkeypatch.setattr(server, 'INFLUXDB_ORG', org)
+
+        with pytest.raises(ValueError, match=expected_message):
+            server.resolve_influxdb_config(require_org=True)
+
+    @pytest.mark.parametrize(
+        ('url', 'expected_message'),
+        [
+            (' ', 'non-empty string'),
+            ('https:///', 'must include a host'),
+        ],
+    )
+    def test_normalize_influxdb_url_rejects_missing_url_components(self, url, expected_message):
+        """Test that blank URLs and URLs without hosts are rejected."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import normalize_influxdb_url
+
+        with pytest.raises(ValueError, match=expected_message):
+            normalize_influxdb_url(url)
+
+    def test_normalize_influxdb_url_normalizes_ipv6_host(self):
+        """Test that IPv6 hosts retain brackets after normalization."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import normalize_influxdb_url
+
+        assert (
+            normalize_influxdb_url('https://[2001:db8::1]:8086/') == 'https://[2001:db8::1]:8086'
+        )
+
+    @patch(
+        'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_URL', 'https://env.example.com'
+    )
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_TOKEN', 'env-token')
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ORG', 'env-org')
+    def test_resolve_does_not_leak_env_token_to_custom_url(self):
+        """Test that env token is never sent to a caller-supplied URL (SSRF prevention)."""
+        from awslabs.timestream_for_influxdb_mcp_server.server import resolve_influxdb_config
+
+        with pytest.raises(ValueError) as excinfo:
+            resolve_influxdb_config(url='https://evil.example.com', token=None, org=None)
+
+        assert 'Server credentials cannot be mixed' in str(excinfo.value)
+
+
+@patch(
+    'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+    'https://influxdb-example.aws:8086',
+)
 class TestInfluxDBAsyncWriteMode:
     """Tests for InfluxDB async write mode."""
 
@@ -2350,7 +2540,6 @@ class TestInfluxDBAsyncWriteMode:
             time_precision='ns',
             sync_mode='asynchronous',
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         mock_client.write_api.assert_called_once()
@@ -2374,13 +2563,16 @@ class TestInfluxDBAsyncWriteMode:
             time_precision='ns',
             sync_mode='asynchronous',
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         mock_client.write_api.assert_called_once()
         assert result['status'] == 'success'
 
 
+@patch(
+    'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+    'https://influxdb-example.aws:8086',
+)
 class TestInfluxDBCreateBucketWithRetention:
     """Tests for influxdb_create_bucket with retention rules."""
 
@@ -2417,7 +2609,6 @@ class TestInfluxDBCreateBucketWithRetention:
             retention_seconds=86400,
             description='Test bucket with retention',
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         mock_buckets_api.create_bucket.assert_called_once()
@@ -2444,8 +2635,469 @@ class TestInfluxDBCreateBucketWithRetention:
             retention_seconds=None,
             description=None,
             verify_ssl=True,
-            tool_write_mode=True,
         )
 
         assert result['status'] == 'error'
         assert 'not found' in result['message']
+
+
+@patch(
+    'awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_ALLOWED_URLS',
+    'https://influxdb-example.aws:8086',
+)
+class TestFluxQueryWriteGuard:
+    """Tests proving write-shaped Flux is rejected in read-only mode (default).
+
+    These tests validate the defense-in-depth fix for the security vulnerability
+    where InfluxDBQuery could execute Flux write primitives (to(), experimental.to(),
+    influxdb.wideTo()) without a write-mode guard.
+    """
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_pipe_forward_to(self, mock_get_client):
+        """Test that pipe-forward to() is rejected in read-only mode."""
+        query = 'from(bucket: "source") |> range(start: -1h) |> to(bucket: "dest")'
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_experimental_to(self, mock_get_client):
+        """Test that experimental.to() is rejected in read-only mode."""
+        query = """import "experimental"
+from(bucket: "source")
+  |> range(start: -1h)
+  |> experimental.to(bucket: "dest", org: "my-org")"""
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_wideTo(self, mock_get_client):
+        """Test that wideTo() is rejected in read-only mode."""
+        query = """import "influxdata/influxdb"
+from(bucket: "source")
+  |> range(start: -1h)
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> wideTo(bucket: "dest")"""
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_influxdb_wideTo(self, mock_get_client):
+        """Test that influxdb.wideTo() is rejected in read-only mode."""
+        query = """import "influxdata/influxdb"
+from(bucket: "source")
+  |> range(start: -1h)
+  |> influxdb.wideTo(bucket: "dest", org: "my-org")"""
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_aliased_experimental_to(self, mock_get_client):
+        """Test that aliased experimental import with to() is rejected."""
+        query = """import ex "experimental"
+from(bucket: "source")
+  |> range(start: -1h)
+  |> ex.to(bucket: "dest")"""
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_to_with_extra_whitespace(self, mock_get_client):
+        """Test that to() with extra whitespace is still caught."""
+        query = 'from(bucket: "source") |>   to  (bucket: "dest")'
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_standalone_to_at_line_start(self, mock_get_client):
+        """Test that standalone to() at line start is rejected."""
+        query = """from(bucket: "source") |> range(start: -1h)
+to(bucket: "dest", org: "my-org")"""
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', True)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_allows_to_when_write_mode_enabled(self, mock_get_client):
+        """Test that to() is allowed when INFLUXDB_WRITE_MODE is True."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.return_value = []
+
+        query = 'from(bucket: "source") |> range(start: -1h) |> to(bucket: "dest")'
+
+        result = await influxdb_query(
+            url='https://influxdb-example.aws:8086',
+            token='test-token',
+            org='test-org',
+            query=query,
+        )
+
+        assert result['status'] == 'success'
+        mock_get_client.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_allows_normal_read_query(self, mock_get_client):
+        """Test that normal read queries are not blocked."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.return_value = []
+
+        query = 'from(bucket: "my-bucket") |> range(start: -1h) |> filter(fn: (r) => r._measurement == "cpu")'
+
+        result = await influxdb_query(
+            url='https://influxdb-example.aws:8086',
+            token='test-token',
+            org='test-org',
+            query=query,
+        )
+
+        assert result['status'] == 'success'
+        mock_get_client.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_allows_toString_function(self, mock_get_client):
+        """Test that toString() is not falsely blocked (no false positive)."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.return_value = []
+
+        query = 'from(bucket: "b") |> range(start: -1h) |> map(fn: (r) => ({r with _value: string(v: r._value)}))'
+
+        result = await influxdb_query(
+            url='https://influxdb-example.aws:8086',
+            token='test-token',
+            org='test-org',
+            query=query,
+        )
+
+        assert result['status'] == 'success'
+        mock_get_client.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_ignores_commented_out_to(self, mock_get_client):
+        """Test that commented-out to() is not blocked."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.return_value = []
+
+        query = """from(bucket: "b") |> range(start: -1h)
+// |> to(bucket: "dest")
+|> yield()"""
+
+        result = await influxdb_query(
+            url='https://influxdb-example.aws:8086',
+            token='test-token',
+            org='test-org',
+            query=query,
+        )
+
+        assert result['status'] == 'success'
+        mock_get_client.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.get_influxdb_client')
+    async def test_rejects_to_in_multiline_query(self, mock_get_client):
+        """Test that to() in a complex multi-line query is caught."""
+        query = """import "influxdata/influxdb"
+
+data = from(bucket: "source")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "cpu")
+  |> aggregateWindow(every: 5m, fn: mean)
+
+data
+  |> to(
+    bucket: "destination",
+    org: "my-org"
+  )"""
+
+        with pytest.raises(ValueError) as excinfo:
+            await influxdb_query(
+                url='https://influxdb-example.aws:8086',
+                token='test-token',
+                org='test-org',
+                query=query,
+            )
+
+        assert 'write-producing Flux operation' in str(excinfo.value)
+        mock_get_client.assert_not_called()
+
+
+class TestValidateFluxQueryUnit:
+    """Unit tests for validate_flux_query function directly."""
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_simple_to(self):
+        """Test simple pipe-forward to()."""
+        with pytest.raises(ValueError):
+            validate_flux_query('from(bucket: "b") |> to(bucket: "x")')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_experimental_to(self):
+        """Test experimental.to()."""
+        with pytest.raises(ValueError):
+            validate_flux_query('data |> experimental.to(bucket: "x")')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_wideTo(self):
+        """Test wideTo()."""
+        with pytest.raises(ValueError):
+            validate_flux_query('data |> wideTo(bucket: "x")')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_influxdb_wideTo(self):
+        """Test influxdb.wideTo()."""
+        with pytest.raises(ValueError):
+            validate_flux_query('data |> influxdb.wideTo(bucket: "x")')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_allows_safe_query(self):
+        """Test that a safe query passes validation."""
+        # Should not raise
+        validate_flux_query('from(bucket: "b") |> range(start: -1h) |> yield()')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', True)
+    def test_allows_write_when_enabled(self):
+        """Test that write is allowed when INFLUXDB_WRITE_MODE is True."""
+        # Should not raise even with to()
+        validate_flux_query('from(bucket: "b") |> to(bucket: "x")')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_ignores_single_line_comment(self):
+        """Test that single-line comments with to() don't trigger rejection."""
+        # Should not raise — the to() is in a comment
+        validate_flux_query(
+            'from(bucket: "b") |> range(start: -1h)\n// |> to(bucket: "x")\n|> yield()'
+        )
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_to_after_comment(self):
+        """Test that to() on a line after a comment is still caught."""
+        query = '// This is a comment\nfrom(bucket: "b") |> to(bucket: "x")'
+        with pytest.raises(ValueError):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_to_in_assignment_position(self):
+        """Test that to() called as an assignment right-hand side is caught."""
+        query = 'data = from(bucket: "src")\nresult = to(bucket: "dst", tables: data)'
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_write_function_bound_to_another_name(self):
+        """Test that binding to() to another name and piping into it is caught."""
+        query = 'writer = to\nfrom(bucket: "src") |> writer(bucket: "dst")'
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_write_wrapped_in_user_defined_function(self):
+        """Test that a write hidden inside a user-defined function is caught."""
+        query = 'f = (tables=<-) => tables |> to(bucket: "dst")\nfrom(bucket: "src") |> f()'
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_write_through_aliased_package_import(self):
+        """Test that an aliased package import does not hide a qualified write."""
+        query = 'import e "experimental"\ndata |> e.to(bucket: "dst")'
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_write_split_across_lines(self):
+        """Test that a newline between to() and its parenthesis is still a write."""
+        query = 'from(bucket: "src") |> to\n(bucket: "dst")'
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_write_hidden_behind_url_in_string(self):
+        """Test that a URL in a string does not hide a later to() on the same line."""
+        query = (
+            'from(bucket: "src") '
+            + '|> map(fn: (r) => ({r with url: "http://example"})) |> to(bucket: "dst")'
+        )
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_write_after_escaped_quote(self):
+        """Test that an escaped quote does not end the literal early and hide a write."""
+        query = 'from(bucket: "src") |> filter(fn: (r) => r.m == "a\\"b") |> to(bucket: "dst")'
+        with pytest.raises(ValueError, match='write-producing'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_string_interpolation(self):
+        """Test that interpolation is refused, since masking cannot be trusted."""
+        query = 'b = "dst"\nfrom(bucket: "src") |> to(bucket: "${b}")'
+        with pytest.raises(ValueError, match='interpolation is not permitted'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_interpolation_without_any_write_function(self):
+        """Test that interpolation is refused on its own merits, not via to().
+
+        The interpolation guard must run against the raw query. Checking the
+        masked query instead makes it dead code, because masking blanks the
+        string contents in which the interpolation appears.
+        """
+        query = 'b = "src"\nfrom(bucket: "${b}") |> range(start: -1h)'
+        with pytest.raises(ValueError, match='interpolation is not permitted'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_rejects_interpolation_with_nested_quotes(self):
+        """Test that interpolation containing nested quotes cannot smuggle a write."""
+        query = 'from(bucket: "${x + "y"}") |> to(bucket: "dst")'
+        with pytest.raises(ValueError, match='interpolation is not permitted'):
+            validate_flux_query(query)
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_allows_write_function_name_inside_string_literal(self):
+        """Test that a string literal resembling a call is data, not code."""
+        # Should not raise — the text is a string literal, not an invocation
+        validate_flux_query(
+            'from(bucket: "src")\n  |> filter(fn: (r) => r.message == "experimental.to(")'
+        )
+
+    @pytest.mark.parametrize(
+        'expression',
+        [
+            'toString(v: r._value)',
+            'toFloat(v: r._value)',
+            'toInt(v: r._value)',
+            'toBool(v: r._value)',
+            'toTime(v: r._value)',
+            'toUInt(v: r._value)',
+        ],
+    )
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_allows_to_prefixed_conversion_functions(self, expression):
+        """Test that the toX() conversion family are reads and are not rejected."""
+        # Should not raise — these are read-only type conversions
+        validate_flux_query(f'from(bucket: "b") |> map(fn: (r) => ({{r with s: {expression}}}))')
+
+    @patch('awslabs.timestream_for_influxdb_mcp_server.server.INFLUXDB_WRITE_MODE', False)
+    def test_allows_double_slash_inside_string_on_earlier_line(self):
+        """Test that // inside a string literal does not consume later lines."""
+        # Should not raise, and the trailing range() must remain visible
+        validate_flux_query(
+            'from(bucket: "b")\n'
+            + '  |> filter(fn: (r) => r.u == "http://a//b")\n'
+            + '  |> range(start: -1h)'
+        )
+
+    def test_masking_preserves_length_and_line_structure(self):
+        """Test that masking keeps offsets and newlines aligned with the input."""
+        query = 'from(bucket: "src") // note\n|> range(start: -1h)'
+        masked = mask_flux_comments_and_strings(query)
+        assert len(masked) == len(query)
+        assert masked.count('\n') == query.count('\n')
+
+    def test_masking_blanks_string_contents_but_keeps_code(self):
+        """Test that string contents are blanked while surrounding code remains."""
+        masked = mask_flux_comments_and_strings('from(bucket: "to(")')
+        assert masked.startswith('from(bucket:')
+        assert 'to(' not in masked.replace('from(', '')
+
+    def test_masking_does_not_treat_slashes_in_strings_as_comments(self):
+        """Test that // inside a literal is data, so following code stays visible."""
+        masked = mask_flux_comments_and_strings('a = "http://x" |> range()')
+        assert '|> range()' in masked

@@ -14,6 +14,7 @@
 
 """Constants for aws-transform-mcp-server."""
 
+import httpx
 from typing import List, Set
 
 
@@ -32,12 +33,34 @@ CLIENT_APP_ID = 'atx-mcp'
 # ── FES SigV4 ───────────────────────────────────────────────────────────
 FES_SERVICE = 'elasticgumbyfrontendservice'
 
+# ── Transform Streaming Service (event-stream ops: GetArtifact, ConverseStream) ──
+# Distinct Coral service from FES: separate targetPrefix and SigV4 signing name.
+# Served on the same api.transform.<region>.on.aws endpoint.
+STREAMING_SERVICE = 'transformstreaming'
+STREAMING_TARGET_BEARER = 'AWSTransformStreamingService'
+
 # ── HTTP retry / timeout ─────────────────────────────────────────────────
 TIMEOUT_SECONDS: float = 60.0
 STARTUP_TIMEOUT_SECONDS: float = 5.0
 STARTUP_MAX_RETRIES: int = 0
 MAX_RETRIES: int = 3
 RETRYABLE_STATUSES: Set[int] = {429, 500, 502, 503, 504}
+
+# ── Artifact transfer timeout ────────────────────────────────────────────
+# Uploads are buffered and sent as a single byte stream, so large files need
+# a longer write timeout than ordinary API requests.
+ARTIFACT_UPLOAD_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=60.0,
+    write=900.0,
+    pool=10.0,
+)
+ARTIFACT_DOWNLOAD_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=60.0,
+    write=60.0,
+    pool=10.0,
+)
 
 # ── Token refresh ────────────────────────────────────────────────────────
 TOKEN_REFRESH_BUFFER_SECS: int = 300  # refresh if < 5 min left
@@ -59,7 +82,35 @@ FES_REGIONS: List[str] = [
     'sa-east-1',
     'ap-south-1',
     'ca-central-1',
+    'ap-southeast-1',
 ]
+
+# ── FES deployed GovCloud regions ────────────────────────────────────────
+FES_GOV_REGIONS: List[str] = [
+    'us-gov-west-1',
+]
+
+GOV_REGION_PREFIX: str = 'us-gov-'
+
+
+def fes_regions_for(region: str) -> List[str]:
+    """Return the FES regions to fan out over, scoped to ``region``'s partition.
+
+    GovCloud is a separate partition: neither IAM credentials nor Identity
+    Center tokens cross it, so probing the other partition's regions can only
+    ever fail. Each list is fanned out on its own.
+
+    Args:
+        region: Any region in the caller's partition (the resolved AWS region
+            for credential auth, or the Identity Center region for SSO).
+
+    Returns:
+        The FES regions for that partition.
+    """
+    if region.startswith(GOV_REGION_PREFIX):
+        return list(FES_GOV_REGIONS)
+    return list(FES_REGIONS)
+
 
 # ── Fan-out timeout for profile discovery (seconds per region) ──────────
 PROFILE_DISCOVERY_TIMEOUT_SECONDS: float = 5.0

@@ -15,219 +15,571 @@
 """Redshift MCP Server implementation."""
 
 import os
+import re
 import sys
+from awslabs.redshift_mcp_server.catalog import (
+    discover_columns,
+    discover_databases,
+    discover_schemas,
+    discover_tables,
+)
+from awslabs.redshift_mcp_server.clusters import discover_clusters, resolve_cluster
 from awslabs.redshift_mcp_server.consts import (
-    CLIENT_BEST_PRACTICES,
-    DEFAULT_LOG_LEVEL,
-    REDSHIFT_BEST_PRACTICES,
+    ACCESS_MODE_READ_WRITE,
+    LOG_LEVEL_DEFAULT,
 )
 from awslabs.redshift_mcp_server.models import (
+    ClusterKey,
     QueryResult,
     RedshiftCluster,
     RedshiftColumn,
     RedshiftDatabase,
     RedshiftSchema,
     RedshiftTable,
+    Target,
 )
 from awslabs.redshift_mcp_server.redshift import (
-    discover_clusters,
-    discover_columns,
-    discover_databases,
-    discover_schemas,
-    discover_tables,
     execute_query,
 )
+from awslabs.redshift_mcp_server.review.executor import review_cluster
+from awslabs.redshift_mcp_server.review.models import ReviewResult
+from awslabs.redshift_mcp_server.settings import (
+    max_open_transactions_per_target,
+    max_result_rows,
+    resolve_access_mode,
+    resolve_skip_write_confirmation,
+    session_keepalive,
+)
+from awslabs.redshift_mcp_server.sql_guard import assert_executable, might_write
+from botocore.exceptions import BotoCoreError, ClientError
 from loguru import logger
-from mcp.server.fastmcp import Context, FastMCP
-from pydantic import Field
+from mcp.server.mcpserver import Context, Elicit, MCPServer, Resolve
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ClientCapabilities, ElicitationCapability, ToolAnnotations
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import Annotated, Any, Callable, Literal, NoReturn, TextIO, TypeVar
 
 
 # Remove default handler and add custom configuration
 logger.remove()
-logger.add(
-    os.environ.get('LOG_FILE', sys.stderr),
-    level=os.environ.get('FASTMCP_LOG_LEVEL', DEFAULT_LOG_LEVEL),
+
+
+def _resolve_log_level() -> str:
+    """Resolve the log level, falling back rather than refusing to start.
+
+    Loguru rejects a level it does not know, and this runs at import, so a lowercase level or the
+    empty string an MCP config template leaves behind otherwise takes the server down with a
+    traceback and no tools. Every other setting falls back with a warning; so does this one,
+    printed rather than logged, since it is configuring the logger it would warn through.
+
+    Returns:
+        A level loguru accepts.
+    """
+    # LOG_LEVEL is the documented variable; FASTMCP_LOG_LEVEL is an undocumented fallback kept so
+    # existing configurations keep working.
+    raw = os.environ.get('LOG_LEVEL') or os.environ.get('FASTMCP_LOG_LEVEL') or LOG_LEVEL_DEFAULT
+    level = raw.strip().upper()
+
+    try:
+        logger.level(level)
+    except ValueError:
+        print(
+            f'LOG_LEVEL={raw!r} is not a level loguru knows, using {LOG_LEVEL_DEFAULT}.',
+            file=sys.stderr,
+        )
+        return LOG_LEVEL_DEFAULT
+
+    return level
+
+
+def _resolve_log_file() -> str | TextIO:
+    """Resolve where to log, treating an empty value as unset.
+
+    Read with a default instead, the empty string an MCP config template leaves behind reached
+    loguru as a path, resolved to the working directory, and the IsADirectoryError took the whole
+    server down at import - no tools, and an error naming a directory nobody had configured.
+
+    Returns:
+        The configured path, or stderr.
+    """
+    return os.environ.get('LOG_FILE') or sys.stderr
+
+
+logger.add(_resolve_log_file(), level=_resolve_log_level())
+
+
+# Resolved here, rather than on first use like the settings that carry their own accessor,
+# because this point is past the logger.add above and so the warnings both resolvers raise
+# reach LOG_FILE. Once is enough: neither setting can change while the server runs.
+ACCESS_MODE = resolve_access_mode()
+SKIP_WRITE_CONFIRMATION = resolve_skip_write_confirmation(ACCESS_MODE)
+
+
+def _current_settings() -> str:
+    """Report the settings this server resolved at startup.
+
+    Listed in the instructions right after GUIDE_POINTER, since the caller cannot read the
+    server's environment and would otherwise have to guess which branch of the prose naming
+    these settings applies.
+
+    Returns:
+        A markdown section listing each setting and its resolved value.
+    """
+    settings = (
+        f'- `ACCESS_MODE`: {ACCESS_MODE}\n'
+        f'- `UNSAFE_SKIP_WRITE_CONFIRMATION`: {str(SKIP_WRITE_CONFIRMATION).lower()}\n'
+        f'- `SESSION_KEEPALIVE`: {session_keepalive()} seconds\n'
+        f'- `MAX_OPEN_TRANSACTIONS_PER_TARGET`: {max_open_transactions_per_target()}\n'
+        f'- `MAX_RESULT_ROWS`: {max_result_rows()}\n'
+    )
+
+    if SKIP_WRITE_CONFIRMATION:
+        settings += (
+            '\nNo confirmation prompt reaches the user before a write runs, so the database '
+            'user privileges are the only remaining control. Tell the user what a write will '
+            'change and get their agreement yourself before submitting it.\n'
+        )
+
+    return f'\n## Current Settings\n\nFixed for the life of this server process:\n\n{settings}'
+
+
+# First in the instructions and in every tool description but retrieve_skill_file's own, since a
+# client may show the model only one of them: some never show the instructions, and some show a
+# tool's description only once the model loads that tool.
+GUIDE_POINTER = (
+    'Once per conversation, before answering or acting on any Redshift request, call '
+    'retrieve_skill_file with no argument and follow the guide it returns.'
 )
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     'awslabs.redshift-mcp-server',
-    instructions=f"""
-# Amazon Redshift MCP Server.
+    # Some clients keep only the first 2,048 characters, so the pointer and the settings lead,
+    # and the sections after them run from the costliest to lose to the cheapest.
+    instructions=GUIDE_POINTER
+    + '\n'
+    + _current_settings()
+    + """
+## Cluster identifiers
 
-This MCP server provides comprehensive access to Amazon Redshift clusters and serverless workgroups.
+A provisioned cluster and a serverless workgroup can share an identifier, and are separate
+warehouses holding their own data. When the user names one that `list_clusters` shows under both
+types, ask which they mean.
 
-## Available Tools
+## Result size
 
-### list_clusters
-Lists all available Redshift clusters and serverless workgroups in your AWS account.
-This tool provides essential information needed to connect to and query your Redshift instances.
+Every tool that runs SQL refuses a result of more than `MAX_RESULT_ROWS` rows rather than
+returning part of it. The limit counts rows, not bytes: wide rows within it can still make a
+result of tens of megabytes, so name only the columns you need.
 
-### list_databases
-Lists all databases in a specified Redshift cluster.
-This tool queries the SVV_REDSHIFT_DATABASES system view to discover available databases.
+## Concurrency
 
-### list_schemas
-Lists all schemas in a specified database within a Redshift cluster.
-This tool queries the SVV_ALL_SCHEMAS system view to discover available schemas.
+Without a transaction parameter, each statement runs on its own connection: statements
+against the same `cluster:database` run concurrently, including behind a long-running one. A
+named transaction's statements share one connection and are serialized against each other, but
+not against anything else.
 
-### list_tables
-Lists all tables in a specified schema within a Redshift database.
-This tool queries the SVV_ALL_TABLES system view to discover available tables.
+## Credentials and region
 
-### list_columns
-Lists all columns in a specified table within a Redshift schema.
-This tool queries the SVV_ALL_COLUMNS system view to discover available columns.
+The default AWS credentials chain, or the `AWS_PROFILE` profile when set, which then takes
+precedence over keys in the environment. Region precedence is
+`AWS_REGION`, then `AWS_DEFAULT_REGION`, then the profile's own region.
 
-### execute_query
-Executes SQL queries against a Redshift cluster or serverless workgroup.
-This tool uses the Redshift Data API to run queries and return results.
-
-## Getting Started
-
-1. Ensure your AWS configuration and credentials are configured (environment variables or profile configuration file).
-2. Use the list_clusters tool to discover available Redshift instances.
-3. Note the cluster identifiers for use with other tools (coming in future milestones).
-
-{CLIENT_BEST_PRACTICES}
-{REDSHIFT_BEST_PRACTICES}
+Report AWS client errors in full — they name the misconfiguration. For a region error point
+at `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile; for a credentials error, at the
+credentials setup and its permissions.
 """,
-    dependencies=['boto3', 'loguru', 'pydantic', 'regex'],
+    dependencies=['boto3', 'loguru', 'pydantic', 'sqlglot'],
 )
 
 
-@mcp.tool(name='list_clusters')
+# One type and description for every tool that takes a cluster, so they cannot drift apart.
+_ClusterType = Literal['provisioned', 'serverless']
+_CLUSTER_TYPE_DESCRIPTION = 'The type list_clusters reports for the cluster.'
+
+
+def _read_only_annotations(title: str, open_world: bool = True) -> ToolAnnotations:
+    """Return read-only tool annotations; open_world means it reads the caller's AWS account."""
+    return ToolAnnotations(
+        title=title,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=open_world,
+    )
+
+
+_Tool = TypeVar('_Tool', bound=Callable[..., Any])
+
+
+def _guided(fn: _Tool) -> _Tool:
+    """Put GUIDE_POINTER first in a tool's description, which the SDK reads from `__doc__`."""
+    fn.__doc__ = f'{GUIDE_POINTER}\n\n{fn.__doc__}'
+    return fn
+
+
+class ConfirmWrite(BaseModel):
+    """Response schema for the read-write confirmation prompt."""
+
+    confirmed: bool = Field(
+        description='True to execute the statement, false to abandon it.',
+    )
+
+
+def _write_confirmation(
+    ctx: Context,
+    cluster_identifier: str,
+    cluster_type: str,
+    database_name: str,
+    sql: str | None,
+    begin_transaction: str | None = None,
+    in_transaction: str | None = None,
+    commit_transaction: str | None = None,
+    rollback_transaction: str | None = None,
+) -> ConfirmWrite | Elicit[ConfirmWrite]:
+    """Resolve the caller's approval for one statement.
+
+    Returning `Elicit` asks the client. The framework runs the round trip on whichever
+    shape the negotiated protocol requires and aborts the call on decline or cancel.
+    Returning a value asks nothing, which is the case for read-only mode, the
+    confirmation opt-out, a call carrying no statement, and recognized reads.
+
+    Args:
+        ctx: The tool call context, used to check what the client can do.
+        cluster_identifier: The target cluster, named in the prompt.
+        cluster_type: The target cluster's type, named in the prompt.
+        database_name: The target database, named in the prompt.
+        sql: The statement awaiting approval, or None when the call carries none.
+        begin_transaction: Name of a transaction being opened, if any.
+        in_transaction: Name of a transaction being added to, if any.
+        commit_transaction: Name of a transaction being committed, if any.
+        rollback_transaction: Name of a transaction being rolled back, if any.
+
+    A decline or cancel is not observable here: the framework aborts the call after this
+    returns, so only the request to ask is logged, not its answer.
+
+    Returns:
+        A standing approval when no confirmation is required, else a request to ask.
+
+    Raises:
+        ToolError: If the SQL is rejected by the guard, or the client cannot be asked.
+    """
+    if ACCESS_MODE != ACCESS_MODE_READ_WRITE or SKIP_WRITE_CONFIRMATION:
+        return ConfirmWrite(confirmed=True)
+
+    if sql is None:
+        # Nothing of the caller's runs: the call opens or closes a transaction, whose writes are
+        # each confirmed when submitted, or the tool body refuses it.
+        return ConfirmWrite(confirmed=True)
+
+    # Reject before asking, so a statement that cannot run never raises a prompt. Only
+    # this server's read-only protection is off here; the mode is read-write by this point.
+    assert_executable(
+        sql,
+        enforce_read_only=False,
+        in_transaction=bool(
+            begin_transaction or in_transaction or commit_transaction or rollback_transaction
+        ),
+    )
+
+    # Every write is asked about, including one the batch-denied compatibility path is about to
+    # refuse anyway. Skipping the prompt for those read the denial here and acted on it in the
+    # tool body, and the re-probe window can fall between the two: latched when this ran, spent
+    # by the time the body probed, and the write went through unasked. One pointless prompt in a
+    # configuration where every write is refused is the cheaper side of that trade.
+    if not might_write(sql):
+        return ConfirmWrite(confirmed=True)
+
+    # From the arguments the tool body resolves, so it names the warehouse the statement reaches.
+    target = Target(ClusterKey(cluster_identifier, cluster_type), database_name)
+
+    # Checked here, rather than leaving it to the framework, so the error names the
+    # setting that lets the operator proceed.
+    if not ctx.session.check_client_capability(
+        ClientCapabilities(elicitation=ElicitationCapability())
+    ):
+        logger.warning(f'Refused a write on {target}: the client cannot be asked to confirm it.')
+        raise ToolError(
+            'This MCP client cannot prompt for confirmation, so the statement was not '
+            'run. Use a client that supports elicitation, or set '
+            'UNSAFE_SKIP_WRITE_CONFIRMATION=true to execute writes unconfirmed.'
+        )
+
+    # Logged each time this runs, which depends on the protocol. Before the 2026-07-28 revision the
+    # SDK elicits inside the call and runs this once. From it on, the SDK runs this again after the
+    # answer, so the pair brackets the round trip and the gap is how long the caller took to
+    # decide. Worded as a requirement rather than an act, since only the first of a pair asks.
+    logger.info(f'Write on {target} requires confirmation')
+
+    # What the caller is agreeing to differs by action, and the difference is what they are
+    # deciding. A statement submitted with commit_transaction is committed by the same call,
+    # and one submitted with rollback_transaction is discarded by it, so neither is pending.
+    if commit_transaction is not None:
+        consequence = (
+            f'It runs inside transaction {commit_transaction!r} and commits it, so it is final '
+            f'and cannot be rolled back.'
+        )
+    elif rollback_transaction is not None:
+        # Scoped to the database deliberately. A rollback discards what the transaction wrote
+        # there, and reaches nothing outside it: UNLOAD has already written to S3 by then, and
+        # with CLEANPATH has already deleted what was there.
+        consequence = (
+            f'It runs inside transaction {rollback_transaction!r} and then rolls it back, so '
+            f'any change it makes in the database is discarded. Anything it does outside the '
+            f'database, such as writing to S3, is not.'
+        )
+    elif begin_transaction or in_transaction:
+        transaction = begin_transaction or in_transaction
+        consequence = (
+            f'It runs inside transaction {transaction!r}, so any change it makes in the '
+            f'database is not final until you commit. Anything it does outside the database, '
+            f'such as writing to S3, is final as soon as it runs.'
+        )
+    else:
+        consequence = 'It runs with autocommit and cannot be rolled back.'
+
+    return Elicit(
+        message=(f'Execute this statement against {target}? {consequence}\n\n{sql}'),
+        schema=ConfirmWrite,
+    )
+
+
+def _execute_query_annotations(access_mode: str) -> ToolAnnotations:
+    """Return execute_query annotations matching the configured access mode.
+
+    In read-write mode the tool can modify and delete data, so the hints must say so
+    rather than advertise the read-only guarantee the server no longer enforces.
+
+    Args:
+        access_mode: The resolved access mode, one of `ACCESS_MODES`.
+
+    Returns:
+        Annotations describing execute_query under the configured mode.
+    """
+    if access_mode != ACCESS_MODE_READ_WRITE:
+        return _read_only_annotations('Execute read-only Redshift query')
+
+    return ToolAnnotations(
+        title='Execute read-write Redshift query',
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    )
+
+
+def _tool_failed(tool: str, error: Exception) -> NoReturn:
+    """Log a failed tool call and raise what the caller needs to see.
+
+    The SDK withholds the text of anything that is not a `ToolError`, so an AWS error would
+    otherwise reach the caller as a bare "Error executing tool ..." with nothing to act on.
+
+    Every tool routes its failures here, and this logs each at ERROR; some layers below log their
+    own at ERROR too. Note for whoever ships this log elsewhere: an engine error carries the
+    offending value, column or relation from the statement, so an ERROR line can quote statement
+    content that `LOG_LEVEL` otherwise keeps at DEBUG.
+
+    A `ClientError` is AWS reporting a condition the caller can usually resolve: a paused or
+    resuming cluster, an endpoint not yet available, throttling, expired credentials, a missing
+    grant. Its message is theirs to read. A `BotoCoreError` is the SDK's own failure - no region,
+    no credentials, an unknown profile, a connection that could not be made or timed out - and
+    its text is what the operator needs to act on, so it is useless withheld. Anything
+    else is a defect in this server, whose text would tell them nothing useful, so it stays
+    withheld.
+
+    Args:
+        tool: Name of the tool that failed, for the log.
+        error: What it failed with.
+
+    Raises:
+        ToolError: If AWS reported the failure.
+        Exception: The original error otherwise, for the SDK to report as a crash.
+    """
+    logger.error(f'Error in {tool}: {error}')
+
+    if isinstance(error, (ClientError, BotoCoreError)):
+        raise ToolError(str(error)) from error
+
+    raise error
+
+
+# Kiro IDE cuts a tool result of more than 30,000 chars down to its two ends, so each file is
+# served in chunks of this many chars.
+_CHUNK_CHARS = 25_000
+
+
+def _chunks(text: str) -> list[str]:
+    """Split `text` into consecutive chunks of `_CHUNK_CHARS` chars."""
+    return [text[at : at + _CHUNK_CHARS] for at in range(0, len(text), _CHUNK_CHARS)]
+
+
+# The guide is SKILL.md without its frontmatter, which addresses skill loaders, not the model.
+# Read once, at import; the unpacking fails the import if SKILL.md has no frontmatter block.
+_SKILL_DIR = Path(__file__).parent / 'skills' / 'redshift-guide'
+_, _guide = re.split(
+    r'\A---\n.*?\n---\n',
+    (_SKILL_DIR / 'SKILL.md').read_text(encoding='utf-8'),
+    maxsplit=1,
+    flags=re.DOTALL,
+)
+_GUIDE = _chunks(_guide)
+
+# Keyed by the path the guide cites each file by, sorted. A lookup reaches only these.
+_REFERENCES = {
+    f'references/{path.name}': _chunks(path.read_text(encoding='utf-8'))
+    for path in sorted((_SKILL_DIR / 'references').glob('*.md'))
+}
+
+_SKILL_USAGE = (
+    'Once per conversation, before answering or acting on any Redshift request, call this tool '
+    'with no argument. The text it returns is the Redshift guide, and applies to every request '
+    'to this server. The guide cites reference files as `references/<file>.md`; when it says to '
+    'load one, call this tool with `file` set to that path, exactly as cited. To load a file of '
+    'more than one chunk, request all its chunks in parallel: '
+    + ', '.join(
+        f'`{file}` ({len(chunks)} chunks)'
+        for file, chunks in _REFERENCES.items()
+        if len(chunks) > 1
+    )
+    + '. Call it again with no argument only if the guide is no longer in the conversation.'
+)
+
+
+@mcp.tool(
+    name='retrieve_skill_file',
+    description=_SKILL_USAGE,
+    annotations=_read_only_annotations('Retrieve Redshift guide', open_world=False),
+    # Without this a str return also goes out as structured content, so each file crosses twice.
+    structured_output=False,
+)
+async def retrieve_skill_file_tool(
+    file: Annotated[
+        str | None,
+        Field(
+            description=(
+                "A reference file's path, exactly as the guide cites it, such as "
+                '`references/<file>.md`. Omit for the guide itself.'
+            )
+        ),
+    ] = None,
+    chunk: Annotated[int, Field(ge=1, description='The chunk to return, from 1.')] = 1,
+) -> str:
+    """Return chunk `chunk` of the guide, or of the reference file at the path `file` names.
+
+    Clients get `_SKILL_USAGE` as this tool's description.
+
+    Raises:
+        ToolError: If `file` is not the path of a file under `references/`, or the file has no
+            chunk `chunk`.
+    """
+    chunks = _GUIDE if file is None else _REFERENCES.get(file)
+    if chunks is None:
+        raise ToolError(
+            f'Skill file not found: {file!r}. Available files: {", ".join(_REFERENCES)}'
+        )
+
+    name = file or 'SKILL.md'
+    if chunk > len(chunks):
+        raise ToolError(f'Chunk {chunk} not found: {name} ends at chunk {len(chunks)}.')
+
+    logger.info(f'Serving skill file {name} chunk {chunk} of {len(chunks)}')
+    text = chunks[chunk - 1]
+    if chunk < len(chunks):
+        text += f'\n\n[Continued in chunk {chunk + 1} of {len(chunks)}.]'
+    return text
+
+
+@mcp.tool(
+    name='list_clusters',
+    annotations=_read_only_annotations('List Redshift clusters and workgroups'),
+)
+@_guided
 async def list_clusters_tool(ctx: Context) -> list[RedshiftCluster]:
-    """List all available Amazon Redshift clusters and serverless workgroups.
+    """List Redshift clusters and serverless workgroups.
 
-    This tool discovers and returns information about all Redshift clusters and serverless workgroups
-    in your AWS account, including their current status, connection details, and configuration.
+    Returns one entry per cluster: identifier, type (provisioned or serverless), status,
+    database_name, endpoint, port, vpc_id, node_type, number_of_nodes, creation_time,
+    master_username, publicly_accessible, encrypted and tags.
 
-    ## Usage Requirements
+    Only a cluster whose status is 'available' can be queried, and its identifier and type are
+    what every tool that runs SQL takes as its first two arguments.
 
-    - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
-    - Required IAM permissions: redshift:DescribeClusters, redshift-serverless:ListWorkgroups, redshift-serverless:GetWorkgroup.
+    Requires redshift:DescribeClusters and redshift-serverless:ListWorkgroups. Whichever of
+    provisioned or serverless discovery is denied is skipped, so a partial list is normal; both
+    denied is an error, and so is one denied with nothing found of the other type, since an empty
+    list would otherwise read as an account with no clusters at all.
 
-    ## Response Structure
-
-    Returns a list of RedshiftCluster objects with the following structure:
-
-    - identifier: Unique identifier for the cluster/workgroup.
-    - type: Type of cluster (provisioned or serverless).
-    - status: Current status of the cluster.
-    - database_name: Default database name.
-    - endpoint: Connection endpoint information.
-    - port: Connection port.
-    - vpc_id: VPC ID where the cluster resides.
-    - node_type: Node type (for provisioned clusters).
-    - number_of_nodes: Number of nodes (for provisioned clusters).
-    - creation_time: When the cluster was created.
-    - master_username: Master username for the cluster.
-    - publicly_accessible: Whether the cluster is publicly accessible.
-    - encrypted: Whether the cluster is encrypted.
-    - tags: Tags associated with the cluster.
-
-    ## Usage Tips
-
-    1. Use this tool to discover available Redshift instances before attempting connections.
-    2. Note the cluster identifiers for use with other database tools.
-    3. Check the status field to ensure clusters are 'available' before querying.
-    4. Use the endpoint and port information for direct database connections if needed.
-    5. Consider the cluster type (provisioned vs serverless) when planning your queries.
-
-    ## Interpretation Best Practices
-
-    1. Filter results by status to find only available clusters.
-    2. Use cluster identifiers as input for other Redshift tools.
-    3. Consider cluster configuration (node type, encryption) for performance planning.
-    4. Check tags for environment or team information to select appropriate clusters.
+    A serverless workgroup's tags additionally need redshift-serverless:ListTagsForResource, which
+    is optional: without it a workgroup is reported untagged.
     """
     try:
         logger.info('Discovering Redshift clusters and serverless workgroups')
-        clusters_data = await discover_clusters()
+        denied: set[str] = set()
+        clusters = await discover_clusters(denied_sink=denied)
 
-        # Convert to RedshiftCluster models
-        clusters = []
-        for cluster_data in clusters_data:
-            cluster = RedshiftCluster(**cluster_data)
-            clusters.append(cluster)
+        # An empty list is the one partial answer that reads as a complete one: nothing here says
+        # a half was skipped, so a caller who got `[]` while a listing was denied was told the
+        # account holds no Redshift clusters. A list with something in it carries no such claim,
+        # and this tool's contract already says it may be partial.
+        if denied and not clusters:
+            raise ToolError(
+                f'Listing {" and ".join(sorted(denied))} clusters was denied and nothing was '
+                f'found of the type that could be listed, so this cannot tell an account with no '
+                f'clusters from one whose clusters it may not list. Grant the listing permission '
+                f'to settle which it is.'
+            )
 
         logger.info(f'Successfully retrieved {len(clusters)} clusters')
         return clusters
 
     except Exception as e:
-        logger.error(f'Error in list_clusters_tool: {str(e)}')
-        await ctx.error(f'Failed to list clusters: {str(e)}')
-        raise
+        _tool_failed('list_clusters_tool', e)
 
 
-@mcp.tool(name='list_databases')
+@mcp.tool(
+    name='list_databases',
+    annotations=_read_only_annotations('List Redshift databases'),
+)
+@_guided
 async def list_databases_tool(
     ctx: Context,
     cluster_identifier: str = Field(
         ...,
         description='The cluster identifier to query for databases. Must be a valid cluster identifier from the list_clusters tool.',
     ),
+    cluster_type: _ClusterType = Field(..., description=_CLUSTER_TYPE_DESCRIPTION),
     database_name: str = Field(
         'dev',
-        description='The database to connect to for querying system views. Defaults to "dev".',
+        description='The database to connect to for metadata discovery. Defaults to "dev".',
     ),
 ) -> list[RedshiftDatabase]:
-    """List all databases in a specified Amazon Redshift cluster.
+    """List the databases in a cluster.
 
-    This tool queries the SVV_REDSHIFT_DATABASES system view to discover all databases
-    that the user has access to in the specified cluster, including local databases
-    and databases created from datashares.
+    Returns database_name, database_owner, database_type, database_acl, parameters and
+    database_isolation_level.
 
-    ## Usage Requirements
+    database_type is 'local' for a database on the cluster itself, 'shared' for one from a
+    datashare, or 'auto mounted catalog' for one Redshift mounted from an external catalog such
+    as AWS Glue. An auto-mounted catalog is listed here but cannot be explored further, since
+    Redshift refuses to connect to it.
 
-    - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
-    - The cluster must be available and accessible.
-    - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the specified database to query system views.
+    A 'shared' database comes from a datashare, and appears only if the connecting
+    principal has been granted access to the consumer database (GRANT USAGE ON DATABASE
+    <db> TO <principal>) — so a datashare can exist without being listed here.
 
-    ## Parameters
-
-    - cluster_identifier: The unique identifier of the Redshift cluster to query.
-                         IMPORTANT: Use a valid cluster identifier from the list_clusters tool.
-    - database_name: The database to connect to for querying system views (defaults to 'dev').
-
-    ## Response Structure
-
-    Returns a list of RedshiftDatabase objects with the following structure:
-
-    - database_name: The name of the database.
-    - database_owner: The database owner user ID.
-    - database_type: The type of database (local or shared).
-    - database_acl: Access control information (for internal use).
-    - database_options: The properties of the database.
-    - database_isolation_level: The isolation level (Snapshot Isolation or Serializable).
-
-    ## Usage Tips
-
-    1. First use list_clusters to get valid cluster identifiers.
-    2. Ensure the cluster status is 'available' before querying databases.
-    3. Use the default database name unless you know a specific database exists.
-    4. Note database types to understand if they are local or shared from datashares.
-
-    ## Interpretation Best Practices
-
-    1. Focus on 'local' database types for cluster-native databases.
-    2. 'shared' database types indicate databases from datashares.
-    3. Use database names for subsequent schema and table discovery.
-    4. Consider database isolation levels for transaction planning.
+    Requires redshift-data:BatchExecuteStatement, redshift-data:DescribeStatement and
+    redshift-data:GetStatementResult, plus the discovery actions list_clusters names: the
+    cluster identifier is resolved through the same discovery, so a policy with only the
+    redshift-data actions fails this call before it reaches the cluster.
     """
     try:
         logger.info(f'Discovering databases on cluster: {cluster_identifier}')
-        databases_data = await discover_databases(
-            cluster_identifier=cluster_identifier, database_name=database_name
+        databases = await discover_databases(
+            cluster_identifier=cluster_identifier,
+            database_name=database_name,
+            cluster_type=cluster_type,
         )
-
-        # Convert to RedshiftDatabase models
-        databases = []
-        for database_data in databases_data:
-            database = RedshiftDatabase(**database_data)
-            databases.append(database)
 
         logger.info(
             f'Successfully retrieved {len(databases)} databases from cluster {cluster_identifier}'
@@ -235,84 +587,50 @@ async def list_databases_tool(
         return databases
 
     except Exception as e:
-        logger.error(f'Error in list_databases_tool: {str(e)}')
-        await ctx.error(f'Failed to list databases on cluster {cluster_identifier}: {str(e)}')
-        raise
+        _tool_failed('list_databases_tool', e)
 
 
-@mcp.tool(name='list_schemas')
+@mcp.tool(
+    name='list_schemas',
+    annotations=_read_only_annotations('List Redshift schemas'),
+)
+@_guided
 async def list_schemas_tool(
     ctx: Context,
     cluster_identifier: str = Field(
         ...,
         description='The cluster identifier to query for schemas. Must be a valid cluster identifier from the list_clusters tool.',
     ),
+    cluster_type: _ClusterType = Field(..., description=_CLUSTER_TYPE_DESCRIPTION),
     schema_database_name: str = Field(
         ...,
-        description='The database name to list schemas for. Also used to connect to. Must be a valid database name from the list_databases tool.',
+        description='The database name to list schemas for. Also the database connected to. Must be a valid database name from the list_databases tool.',
     ),
 ) -> list[RedshiftSchema]:
-    """List all schemas in a specified database within a Redshift cluster.
+    """List the schemas in a database.
 
-    This tool queries the SVV_ALL_SCHEMAS system view to discover all schemas
-    that the user has access to in the specified database, including local schemas,
-    external schemas, and shared schemas from datashares.
+    Returns database_name, schema_name, schema_owner, schema_type (local, external or
+    shared), schema_acl, source_database and schema_option.
 
-    ## Usage Requirements
+    An 'external' schema points at S3 or another database. A 'shared' schema comes from a
+    datashare and appears only if the principal has been granted access to the consumer
+    database. A database auto-mounted from a Glue Data Catalog cannot be explored: Redshift
+    refuses to connect to it, so this tool fails on one even though list_databases lists it.
 
-    - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
-    - The cluster must be available and accessible.
-    - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the database to query system views.
-
-    ## Parameters
-
-    - cluster_identifier: The unique identifier of the Redshift cluster to query.
-                         IMPORTANT: Use a valid cluster identifier from the list_clusters tool.
-    - schema_database_name: The database name to list schemas for. Also used to connect to.
-                           IMPORTANT: Use a valid database name from the list_databases tool.
-
-    ## Response Structure
-
-    Returns a list of RedshiftSchema objects with the following structure:
-
-    - database_name: The name of the database where the schema exists.
-    - schema_name: The name of the schema.
-    - schema_owner: The user ID of the schema owner.
-    - schema_type: The type of the schema (external, local, or shared).
-    - schema_acl: The permissions for the specified user or user group for the schema.
-    - source_database: The name of the source database for external schema.
-    - schema_option: The options of the schema (external schema attribute).
-
-    ## Usage Tips
-
-    1. First use list_clusters to get valid cluster identifiers.
-    2. Then use list_databases to get valid database names for the cluster.
-    3. Ensure the cluster status is 'available' before querying schemas.
-    4. Note schema types to understand if they are local, external, or shared.
-    5. External schemas connect to external data sources like S3 or other databases.
-
-    ## Interpretation Best Practices
-
-    1. Focus on 'local' schema types for cluster-native schemas.
-    2. 'external' schema types indicate connections to external data sources.
-    3. 'shared' schema types indicate schemas from datashares.
-    4. Use schema names for subsequent table and column discovery.
-    5. Consider schema permissions (schema_acl) for access planning.
+    Requires redshift-data:BatchExecuteStatement, redshift-data:DescribeStatement and
+    redshift-data:GetStatementResult, plus the discovery actions list_clusters names: the
+    cluster identifier is resolved through the same discovery, so a policy with only the
+    redshift-data actions fails this call before it reaches the cluster.
     """
     try:
         logger.info(
             f'Discovering schemas in database {schema_database_name} on cluster {cluster_identifier}'
         )
-        schemas_data = await discover_schemas(
-            cluster_identifier=cluster_identifier, schema_database_name=schema_database_name
+        schemas = await discover_schemas(
+            cluster_identifier=cluster_identifier,
+            schema_database_name=schema_database_name,
+            cluster_type=cluster_type,
         )
-
-        # Convert to RedshiftSchema models
-        schemas = []
-        for schema_data in schemas_data:
-            schema = RedshiftSchema(**schema_data)
-            schemas.append(schema)
 
         logger.info(
             f'Successfully retrieved {len(schemas)} schemas from database {schema_database_name} on cluster {cluster_identifier}'
@@ -320,94 +638,52 @@ async def list_schemas_tool(
         return schemas
 
     except Exception as e:
-        logger.error(f'Error in list_schemas_tool: {str(e)}')
-        await ctx.error(
-            f'Failed to list schemas in database {schema_database_name} on cluster {cluster_identifier}: {str(e)}'
-        )
-        raise
+        _tool_failed('list_schemas_tool', e)
 
 
-@mcp.tool(name='list_tables')
+@mcp.tool(
+    name='list_tables',
+    annotations=_read_only_annotations('List Redshift tables'),
+)
+@_guided
 async def list_tables_tool(
     ctx: Context,
     cluster_identifier: str = Field(
         ...,
         description='The cluster identifier to query for tables. Must be a valid cluster identifier from the list_clusters tool.',
     ),
+    cluster_type: _ClusterType = Field(..., description=_CLUSTER_TYPE_DESCRIPTION),
     table_database_name: str = Field(
         ...,
-        description='The database name to list tables for. Must be a valid database name from the list_databases tool.',
+        description='The database name to list tables for. Also the database connected to. Must be a valid database name from the list_databases tool.',
     ),
     table_schema_name: str = Field(
         ...,
-        description='The schema name to list tables for. Also used to connect to. Must be a valid schema name from the list_schemas tool.',
+        description='The schema name to list tables for. Must be a valid schema name from the list_schemas tool.',
     ),
 ) -> list[RedshiftTable]:
-    """List all tables in a specified schema within a Redshift database.
+    """List the tables in a schema.
 
-    This tool queries the SVV_ALL_TABLES system view to discover all tables
-    that the user has access to in the specified schema, including base tables,
-    views, external tables, and shared tables.
+    Returns database_name, schema_name, table_name, table_acl, table_type and remarks,
+    where table_type is TABLE, VIEW, EXTERNAL TABLE or SHARED TABLE.
 
-    ## Usage Requirements
+    An unknown schema returns an empty list rather than an error.
 
-    - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
-    - The cluster must be available and accessible.
-    - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the database to query system views.
-
-    ## Parameters
-
-    - cluster_identifier: The unique identifier of the Redshift cluster to query.
-                         IMPORTANT: Use a valid cluster identifier from the list_clusters tool.
-    - table_database_name: The database name to list tables for.
-                          IMPORTANT: Use a valid database name from the list_databases tool.
-    - table_schema_name: The schema name to list tables for.
-                        IMPORTANT: Use a valid schema name from the list_schemas tool.
-
-    ## Response Structure
-
-    Returns a list of RedshiftTable objects with the following structure:
-
-    - database_name: The name of the database where the table exists.
-    - schema_name: The schema name for the table.
-    - table_name: The name of the table.
-    - table_acl: The permissions for the specified user or user group for the table.
-    - table_type: The type of the table (views, base tables, external tables, shared tables).
-    - remarks: Remarks about the table.
-
-    ## Usage Tips
-
-    1. First use list_clusters to get valid cluster identifiers.
-    2. Then use list_databases to get valid database names for the cluster.
-    3. Then use list_schemas to get valid schema names for the database.
-    4. Ensure the cluster status is 'available' before querying tables.
-    5. Note table types to understand if they are base tables, views, external tables, or shared tables.
-
-    ## Interpretation Best Practices
-
-    1. Focus on 'TABLE' table types for regular database tables.
-    2. 'VIEW' table types indicate database views.
-    3. 'EXTERNAL TABLE' types indicate connections to external data sources.
-    4. 'SHARED TABLE' types indicate tables from datashares.
-    5. Use table names for subsequent column discovery and query operations.
-    6. Consider table permissions (table_acl) for access planning.
+    Requires redshift-data:BatchExecuteStatement, redshift-data:DescribeStatement and
+    redshift-data:GetStatementResult, plus the discovery actions list_clusters names: the
+    cluster identifier is resolved through the same discovery, so a policy with only the
+    redshift-data actions fails this call before it reaches the cluster.
     """
     try:
         logger.info(
             f'Discovering tables in schema {table_schema_name} in database {table_database_name} on cluster {cluster_identifier}'
         )
-        tables_data = await discover_tables(
+        tables = await discover_tables(
             cluster_identifier=cluster_identifier,
             table_database_name=table_database_name,
             table_schema_name=table_schema_name,
+            cluster_type=cluster_type,
         )
-
-        # Convert to RedshiftTable models
-        tables = []
-        for table_data in tables_data:
-            table = RedshiftTable(**table_data)
-            tables.append(table)
 
         logger.info(
             f'Successfully retrieved {len(tables)} tables from schema {table_schema_name} in database {table_database_name} on cluster {cluster_identifier}'
@@ -415,23 +691,24 @@ async def list_tables_tool(
         return tables
 
     except Exception as e:
-        logger.error(f'Error in list_tables_tool: {str(e)}')
-        await ctx.error(
-            f'Failed to list tables in schema {table_schema_name} in database {table_database_name} on cluster {cluster_identifier}: {str(e)}'
-        )
-        raise
+        _tool_failed('list_tables_tool', e)
 
 
-@mcp.tool(name='list_columns')
+@mcp.tool(
+    name='list_columns',
+    annotations=_read_only_annotations('List Redshift columns'),
+)
+@_guided
 async def list_columns_tool(
     ctx: Context,
     cluster_identifier: str = Field(
         ...,
         description='The cluster identifier to query for columns. Must be a valid cluster identifier from the list_clusters tool.',
     ),
+    cluster_type: _ClusterType = Field(..., description=_CLUSTER_TYPE_DESCRIPTION),
     column_database_name: str = Field(
         ...,
-        description='The database name to list columns for. Must be a valid database name from the list_databases tool.',
+        description='The database name to list columns for. Also the database connected to. Must be a valid database name from the list_databases tool.',
     ),
     column_schema_name: str = Field(
         ...,
@@ -442,81 +719,30 @@ async def list_columns_tool(
         description='The table name to list columns for. Must be a valid table name from the list_tables tool.',
     ),
 ) -> list[RedshiftColumn]:
-    """List all columns in a specified table within a Redshift schema.
+    """List the columns in a table.
 
-    This tool queries the SVV_ALL_COLUMNS system view to discover all columns
-    that the user has access to in the specified table, including detailed information
-    about data types, constraints, and column properties.
+    Returns database_name, schema_name, table_name, column_name, ordinal_position,
+    column_default, is_nullable, data_type, character_maximum_length, numeric_precision,
+    numeric_scale and remarks.
 
-    ## Usage Requirements
+    An unknown table returns an empty list rather than an error.
 
-    - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
-    - The cluster must be available and accessible.
-    - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the database to query system views.
-
-    ## Parameters
-
-    - cluster_identifier: The unique identifier of the Redshift cluster to query.
-                         IMPORTANT: Use a valid cluster identifier from the list_clusters tool.
-    - column_database_name: The database name to list columns for.
-                           IMPORTANT: Use a valid database name from the list_databases tool.
-    - column_schema_name: The schema name to list columns for.
-                         IMPORTANT: Use a valid schema name from the list_schemas tool.
-    - column_table_name: The table name to list columns for.
-                        IMPORTANT: Use a valid table name from the list_tables tool.
-
-    ## Response Structure
-
-    Returns a list of RedshiftColumn objects with the following structure:
-
-    - database_name: The name of the database.
-    - schema_name: The name of the schema.
-    - table_name: The name of the table.
-    - column_name: The name of the column.
-    - ordinal_position: The position of the column in the table.
-    - column_default: The default value of the column.
-    - is_nullable: Whether the column is nullable (yes or no).
-    - data_type: The data type of the column.
-    - character_maximum_length: The maximum number of characters in the column.
-    - numeric_precision: The numeric precision.
-    - numeric_scale: The numeric scale.
-    - remarks: Remarks about the column.
-
-    ## Usage Tips
-
-    1. First use list_clusters to get valid cluster identifiers.
-    2. Then use list_databases to get valid database names for the cluster.
-    3. Then use list_schemas to get valid schema names for the database.
-    4. Then use list_tables to get valid table names for the schema.
-    5. Ensure the cluster status is 'available' before querying columns.
-    6. Note data types and constraints for query planning and data validation.
-
-    ## Interpretation Best Practices
-
-    1. Use ordinal_position to understand column order in the table.
-    2. Check is_nullable for required vs optional fields.
-    3. Use data_type information for proper data handling in queries.
-    4. Consider character_maximum_length for string field validation.
-    5. Use numeric_precision and numeric_scale for numeric field handling.
-    6. Use column names for SELECT statements and query construction.
+    Requires redshift-data:BatchExecuteStatement, redshift-data:DescribeStatement and
+    redshift-data:GetStatementResult, plus the discovery actions list_clusters names: the
+    cluster identifier is resolved through the same discovery, so a policy with only the
+    redshift-data actions fails this call before it reaches the cluster.
     """
     try:
         logger.info(
             f'Discovering columns in table {column_table_name} in schema {column_schema_name} in database {column_database_name} on cluster {cluster_identifier}'
         )
-        columns_data = await discover_columns(
+        columns = await discover_columns(
             cluster_identifier=cluster_identifier,
             column_database_name=column_database_name,
             column_schema_name=column_schema_name,
             column_table_name=column_table_name,
+            cluster_type=cluster_type,
         )
-
-        # Convert to RedshiftColumn models
-        columns = []
-        for column_data in columns_data:
-            column = RedshiftColumn(**column_data)
-            columns.append(column)
 
         logger.info(
             f'Successfully retrieved {len(columns)} columns from table {column_table_name} in schema {column_schema_name} in database {column_database_name} on cluster {cluster_identifier}'
@@ -524,103 +750,267 @@ async def list_columns_tool(
         return columns
 
     except Exception as e:
-        logger.error(f'Error in list_columns_tool: {str(e)}')
-        await ctx.error(
-            f'Failed to list columns in table {column_table_name} in schema {column_schema_name} in database {column_database_name} on cluster {cluster_identifier}: {str(e)}'
-        )
-        raise
+        _tool_failed('list_columns_tool', e)
 
 
-@mcp.tool(name='execute_query')
+@mcp.tool(
+    name='execute_query',
+    annotations=_execute_query_annotations(ACCESS_MODE),
+)
+@_guided
 async def execute_query_tool(
     ctx: Context,
+    confirmation: Annotated[ConfirmWrite, Resolve(_write_confirmation)],
     cluster_identifier: str = Field(
         ...,
         description='The cluster identifier to execute the query on. Must be a valid cluster identifier from the list_clusters tool.',
     ),
+    cluster_type: _ClusterType = Field(..., description=_CLUSTER_TYPE_DESCRIPTION),
     database_name: str = Field(
         ...,
         description='The database name to execute the query against. Must be a valid database name from the list_databases tool.',
     ),
-    sql: str = Field(
-        ..., description='The SQL statement to execute. Should be a single SQL statement.'
-    ),
+    sql: Annotated[
+        str | None,
+        Field(
+            description=(
+                'The SQL statement to execute. Must be a single SQL statement. Whether writes '
+                'are permitted is fixed by the server configuration, not by this call. '
+                'Required on its own and with in_transaction; optional with the other three.'
+            )
+        ),
+    ] = None,
+    begin_transaction: Annotated[
+        str | None,
+        Field(
+            description=(
+                'Open a transaction under this name and run sql inside it, if given. The name '
+                'is yours to choose and to reuse on later calls. Fails if it is already open.'
+            )
+        ),
+    ] = None,
+    in_transaction: Annotated[
+        str | None,
+        Field(description='Run sql inside the transaction already open under this name.'),
+    ] = None,
+    commit_transaction: Annotated[
+        str | None,
+        Field(description='Run sql, if given, then commit the transaction open under this name.'),
+    ] = None,
+    rollback_transaction: Annotated[
+        str | None,
+        Field(
+            description='Run sql, if given, then roll back the transaction open under this name.'
+        ),
+    ] = None,
 ) -> QueryResult:
-    """Execute a SQL query against a Redshift cluster or serverless workgroup.
+    """Execute one SQL statement against a Redshift cluster or serverless workgroup.
 
-    This tool uses the Redshift Data API to execute SQL queries and return results.
-    It supports both provisioned clusters and serverless workgroups, and handles
-    various data types in the result set.
+    Returns columns (names), rows, row_count and query_id. Values are typed as the Data API
+    returns them: SMALLINT, INTEGER and BIGINT as integers, REAL and DOUBLE PRECISION as floats,
+    booleans as booleans, NULL as null, VARBYTE, GEOMETRY and GEOGRAPHY as base64 text, and
+    everything else as a string, including VARCHAR, DECIMAL, dates, times, timestamps and SUPER.
 
-    ## Usage Requirements
+    A result set is read to its end however many pages the service splits it into, so `row_count`
+    is the whole result and there is no second call that continues one. A result of more than
+    MAX_RESULT_ROWS rows, listed under Current Settings in the instructions, is refused rather
+    than cut short, so add a LIMIT or an aggregate to a query that may match more.
 
-    - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
-    - The cluster must be available and accessible.
-    - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have appropriate permissions to execute queries in the specified database.
+    ## Execution Mode
 
-    ## Parameters
+    Fixed at server startup by the ACCESS_MODE environment variable, not per call. This
+    server's resolved settings are listed under Current Settings in its instructions.
 
-    - cluster_identifier: The unique identifier of the Redshift cluster to query.
-                         IMPORTANT: Use a valid cluster identifier from the list_clusters tool.
-    - database_name: The database name to execute the query against.
-                    IMPORTANT: Use a valid database name from the list_databases tool.
-    - sql: The SQL statement to execute. Should be a single SQL statement.
+    - Read-only (default): the statement runs inside `BEGIN READ ONLY ... ROLLBACK`, so
+      nothing is persisted, and statement types the transaction cannot neutralize
+      (`UNLOAD`, `GRANT`, `REVOKE`, `TRUNCATE`, `VACUUM`, `ANALYZE`, `COMMENT`, `CALL`,
+      `CANCEL`, `SET`, `RESET`, `PREPARE`, `EXECUTE`, `DECLARE`, `FETCH`, and calls to
+      `set_config`, `pg_cancel_backend`, `pg_terminate_backend`, `change_query_priority`,
+      `change_session_priority` and `change_user_priority`) are rejected before execution.
+    - Read-write (`ACCESS_MODE=read-write`): the statement runs directly with autocommit
+      and can create, modify and delete data and objects. Outside a transaction there is
+      no rollback and nothing to undo.
 
-    ## Response Structure
+    Transaction control is refused in both modes: `BEGIN`, `START`, `COMMIT`, `END`,
+    `ROLLBACK` and `ABORT` belong to the transaction parameters below, not to `sql`. A
+    statement that moved a boundary itself would leave this server and the engine
+    disagreeing about what is open. `TRUNCATE` and `CALL` are refused inside a named
+    transaction for the same reason, since each can commit and cannot then be rolled back;
+    outside one, both run normally in read-write mode.
 
-    Returns a QueryResult object with the following structure:
+    In read-write mode a statement that may write is confirmed by the caller before it runs,
+    while a recognized read runs unconfirmed. Confirmation is skipped entirely when the
+    operator set `UNSAFE_SKIP_WRITE_CONFIRMATION=true`. A client that cannot prompt is
+    refused rather than executed unconfirmed. Closing a transaction is not itself a write,
+    so `commit_transaction` or `rollback_transaction` alone asks nothing.
 
-    - columns: List of column names in the result set.
-    - rows: List of rows, where each row is a list of values.
-    - row_count: Number of rows returned.
-    - execution_time_ms: Query execution time in milliseconds.
-    - query_id: Unique identifier for the query execution.
+    Both modes accept a single statement only; multi-statement submissions are rejected.
 
-    ## Usage Tips
+    ## Transactions
 
-    1. First use list_clusters to get valid cluster identifiers.
-    2. Then use list_databases to get valid database names for the cluster.
-    3. Ensure the cluster status is 'available' before executing queries.
-    4. Use LIMIT clauses for exploratory queries to avoid large result sets.
-    5. Consider using the metadata discovery tools to understand table structures before querying.
+    Session state needs one: in read-write mode, a temporary table or a `SET` made outside a
+    transaction is gone by the next call, though the statement that made it reports success.
+    Read-only mode refuses `SET` in or out of a transaction.
 
-    ## Data Type Handling
+    Name a transaction to keep it open across calls:
 
-    The tool automatically handles various Redshift data types:
-    - String values (VARCHAR, CHAR, TEXT).
-    - Numeric values (INTEGER, BIGINT, DECIMAL, FLOAT).
-    - Boolean values.
-    - NULL values.
-    - Date and timestamp values (returned as strings).
+        begin_transaction='load' with the first statement, or on its own
+        in_transaction='load' for each statement after that
+        commit_transaction='load' or rollback_transaction='load' to end it
 
-    ## Security Considerations
+    At most one of the four per call. `sql` is required standalone and with `in_transaction`,
+    and optional with the other three.
 
-    - Avoid dynamic SQL construction with user input.
-    - Consider database object permissions.
-    - Currently, the execute_query tool runs the query in a READ ONLY transaction to prevent unintentional modifications.
-    - The READ WRITE mode will be added in the future versions with additional protection mechanisms.
+    Both modes support this. A read-only transaction gives several statements one consistent
+    snapshot and ends in ROLLBACK, commit_transaction included; a read-write one makes them succeed
+    or fail together. Writes inside it are still confirmed one at a time, and a declined write
+    leaves it open.
+
+    A transaction is bound to this server process and to the cluster and database it was
+    opened against, so the same name against a different pair is a different transaction and
+    each call has to carry the pair its own transaction was opened on. A statement that fails
+    inside one aborts it: it is rolled back and its name dropped, so the next call reports it as
+    unknown rather than letting you commit nothing and call it done. A statement refused before
+    it is sent - by the SQL guard, the confirmation step, a malformed call, or a cluster that does
+    not resolve - leaves the transaction as it was. One sent with in_transaction that ran and
+    whose result could not be read leaves it open and yours to commit or roll back, and the error
+    says so. A commit_transaction that fails once sent always ends the transaction. In read-write
+    mode its error says whether the COMMIT stands, may have applied, or was discarded; in
+    read-only mode the transaction is discarded, however the call failed. Redshift ends one left
+    idle for SESSION_KEEPALIVE seconds, and MAX_OPEN_TRANSACTIONS_PER_TARGET caps how many may be
+    open at once against one cluster and database.
+
+    Open and close a transaction in the same stretch of work, because while open it holds a
+    Redshift connection and can block other writers on the tables it touched. Decide the
+    statements it groups first, then run them with nothing in between: no waiting on the
+    user, no waiting on another system, no exploring, no working out what to do next. If the
+    user asks for one to be held open across any of that, tell them first that it stays open
+    until they close it and may block other writers, then get their agreement.
+
+    ## Security
+
+    Avoid building SQL from untrusted input. The database user's privileges are the real
+    boundary, so grant only what the workload needs.
+
+    Requires redshift-data:BatchExecuteStatement, redshift-data:DescribeStatement and
+    redshift-data:GetStatementResult, plus the discovery actions list_clusters names: the
+    cluster identifier is resolved through the same discovery, so a policy with only the
+    redshift-data actions fails this call before it reaches the cluster.
     """
     try:
-        logger.info(f'Executing query on cluster {cluster_identifier} in database {database_name}')
+        logger.info(
+            f'Executing query on cluster {cluster_identifier} in database {database_name} '
+            f'(access mode: {ACCESS_MODE})'
+        )
+
+        if not confirmation.confirmed:
+            raise ToolError('Statement not confirmed; nothing was executed.')
+
         query_result_data = await execute_query(
-            cluster_identifier=cluster_identifier, database_name=database_name, sql=sql
+            cluster_identifier=cluster_identifier,
+            database_name=database_name,
+            sql=sql,
+            enforce_read_only=ACCESS_MODE != ACCESS_MODE_READ_WRITE,
+            begin_transaction=begin_transaction,
+            in_transaction=in_transaction,
+            commit_transaction=commit_transaction,
+            rollback_transaction=rollback_transaction,
+            cluster_type=cluster_type,
         )
 
         # Convert to QueryResult model
         query_result = QueryResult(**query_result_data)
 
         logger.info(
-            f'Successfully executed query on cluster {cluster_identifier}: {query_result.row_count} rows returned in {query_result.execution_time_ms}ms'
+            f'Successfully executed query on cluster {cluster_identifier}: {query_result.row_count} rows returned'
         )
         return query_result
 
     except Exception as e:
-        logger.error(f'Error in execute_query_tool: {str(e)}')
-        await ctx.error(
-            f'Failed to execute query on cluster {cluster_identifier} in database {database_name}: {str(e)}'
+        _tool_failed('execute_query_tool', e)
+
+
+@mcp.tool(
+    name='review_cluster',
+    annotations=_read_only_annotations('Review Redshift cluster'),
+)
+@_guided
+async def review_cluster_tool(
+    ctx: Context,
+    cluster_identifier: str = Field(
+        ...,
+        description='The cluster identifier to run the review on. Must be a valid cluster identifier from the list_clusters tool.',
+    ),
+    cluster_type: _ClusterType = Field(..., description=_CLUSTER_TYPE_DESCRIPTION),
+    database_name: str = Field(
+        'dev',
+        description='The database to connect to for querying system views. Defaults to "dev".',
+    ),
+) -> ReviewResult:
+    """Run a diagnostic review of a Redshift cluster or serverless workgroup.
+
+    Evaluates diagnostic signals against system views and returns the findings that
+    triggered, with a recommendation for each. Provisioned-only diagnostics are skipped
+    automatically for a serverless workgroup.
+
+    Can take minutes: the diagnostics run one at a time.
+
+    ## Reading the result
+
+    - signals_evaluated: how many distinct signals ran, of which findings is the subset that
+      triggered.
+    - findings: one entry per triggered signal, carrying signal_name, section,
+      affected_row_count, unit, and recommendation_ids.
+    - recommendations: deduplicated, each with id, text (markdown, including
+      documentation links) and triggered_by_signals. Their order carries no meaning: it is
+      the order their signals first triggered, not effort and not impact.
+    - queries_executed: names of the diagnostic queries that ran. One query carries several
+      signals, so this is shorter than signals_evaluated.
+
+    Count findings as len(findings), never from affected_row_count: that field counts
+    affected objects in its own `unit` (7 tables, 3 nodes), so two findings each reporting 7
+    tables is "2 findings, each affecting 7 tables", not 14, and not 7 either - only counts
+    come back, not identities, so how many distinct tables the two cover is unknown. Each
+    signal is an independent count(*) and one object can match several, so affected_row_count
+    is NOT additive across findings or recommendations, and values in different units are NOT
+    comparable.
+
+    Zero findings means the cluster is healthy across every signal evaluated. Follow the
+    documentation links in each recommendation. When there are findings, offer to act on
+    them, starting with the lowest-effort, highest-impact items.
+
+    ## Access
+
+    The connected database user must be able to read Redshift system views, which requires
+    superuser or the sys:monitor role:
+
+        GRANT ROLE sys:monitor TO "<database_user>";
+
+    <database_user> is the output of SELECT current_user, quoted because an IAM identity
+    contains a colon (IAM:<user> or IAMR:<role>). Without that access the review fails
+    fast rather than returning partial results.
+
+    Requires redshift-data:BatchExecuteStatement, redshift-data:DescribeStatement and
+    redshift-data:GetStatementResult, plus the discovery actions list_clusters names: the
+    cluster identifier is resolved through the same discovery, so a policy with only the
+    redshift-data actions fails this call before it reaches the cluster.
+    """
+    try:
+        logger.info(f'Running review on cluster {cluster_identifier}, database {database_name}')
+
+        result = await review_cluster(
+            cluster_identifier=cluster_identifier,
+            execute_query_func=execute_query,
+            resolve_cluster_func=resolve_cluster,
+            database_name=database_name,
+            progress_reporter_func=ctx.report_progress,
+            cluster_type=cluster_type,
         )
-        raise
+
+        return result
+
+    except Exception as e:
+        _tool_failed('review_cluster_tool', e)
 
 
 def main():

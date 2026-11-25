@@ -32,10 +32,9 @@ This MCP server is in general availability.
 
 1. `search_documentation`: Search across all AWS documentation, agent skills, and Strands Agents SDK docs with optional topic-based filtering for more targeted results
 2. `read_documentation`: Retrieve and convert AWS documentation and Strands Agents (strandsagents.com) pages to markdown
-3. `recommend`: Get content recommendations for AWS documentation pages
-4. `list_regions`: Retrieve a list of all AWS regions, including their identifiers and names
-5. `get_regional_availability`: Retrieve AWS regional availability information for Services, Features, SDK service APIs and CloudFormation resources
-6. `retrieve_skill`: Retrieve an AWS agent skill that provides domain-specific expertise, workflows, and step-by-step procedures for AWS tasks
+3. `list_regions`: Retrieve a list of all AWS regions, including their identifiers and names
+4. `get_regional_availability`: Retrieve AWS regional availability information for Services, Features, SDK service APIs and CloudFormation resources
+5. `retrieve_skill`: Retrieve an AWS agent skill that provides domain-specific expertise, workflows, and step-by-step procedures for AWS tasks
 
 ### Current knowledge sources
 
@@ -82,6 +81,29 @@ https://knowledge-mcp.global.api.aws
   }
 }
 ```
+
+**fx**
+
+[fx](https://fx.sh) speaks Streamable HTTP natively, so no proxy is needed. Register the server from your terminal:
+
+```bash
+fx mcp add --transport http aws-knowledge-mcp-server https://knowledge-mcp.global.api.aws
+```
+
+Run `fx mcp list` to confirm it was saved. Or add it to `~/.fx/mcp.json`, under an `mcp` key rather than `mcpServers`:
+
+```json
+{
+  "mcp": {
+    "aws-knowledge-mcp-server": {
+      "type": "http",
+      "url": "https://knowledge-mcp.global.api.aws"
+    }
+  }
+}
+```
+
+If a session is already open when you edit the file, run `/mcp reload` to pick up the change.
 
 If the client you are using does not support HTTP transport for MCP or if it encounters issues during setup, you can use the [fastmcp](https://github.com/jlowin/fastmcp) utility to proxy from stdio to HTTP transport. Below is a configuration example for the fastmcp utility.
 

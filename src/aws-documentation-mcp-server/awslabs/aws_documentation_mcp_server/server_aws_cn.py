@@ -14,28 +14,35 @@
 """awslabs AWS China Documentation MCP Server implementation."""
 
 import httpx
-import re
 import uuid
 from awslabs.aws_documentation_mcp_server.server_utils import (
+    DEFAULT_MAX_LENGTH,
     DEFAULT_USER_AGENT,
     read_documentation_impl,
 )
 
 # Import utility functions
 from awslabs.aws_documentation_mcp_server.util import (
+    UnreadablePageError,
+    enforce_redirect_allowlist,
     extract_content_from_html,
     format_documentation_result,
     is_html_content,
+    to_html_page_url,
+    url_matches_allowlist,
 )
 from loguru import logger
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from pydantic import AnyUrl, Field
 from typing import Union
 
 
 SESSION_UUID = str(uuid.uuid4())
 
-mcp = FastMCP(
+# China partition domain allowlist
+CN_ALLOWED_DOMAIN_REGEXES = (r'^https?://docs\.amazonaws\.cn/',)
+
+mcp = MCPServer(
     'awslabs.aws-documentation-mcp-server',
     instructions="""
     # AWS China Documentation MCP Server
@@ -68,7 +75,7 @@ async def read_documentation(
     ctx: Context,
     url: Union[AnyUrl, str] = Field(description='URL of the AWS China documentation page to read'),
     max_length: int = Field(
-        default=5000,
+        default=DEFAULT_MAX_LENGTH,
         description='Maximum number of characters to return.',
         gt=0,
         lt=1000000,
@@ -90,7 +97,7 @@ async def read_documentation(
     ## URL Requirements
 
     - Must be from the docs.amazonaws.cn domain
-    - Must end with .html
+    - Must end with .html or .md
 
     ## Example URLs
 
@@ -103,6 +110,8 @@ async def read_documentation(
     - Preserved headings and structure
     - Code blocks for examples
     - Lists and tables converted to markdown format
+    - Links to other pages kept as published, often relative (e.g. `invocation-sync.md`);
+      resolve a relative link against the page URL before reading it
 
     ## Handling Long Documents
 
@@ -120,18 +129,22 @@ async def read_documentation(
     Returns:
         Markdown content of the AWS China documentation
     """
-    # Validate that URL is from docs.amazonaws.cn and ends with .html
+    # Validate that URL is from docs.amazonaws.cn and ends with .html or .md
     url_str = str(url)
-    if not re.match(r'^https?://docs\.amazonaws\.cn/', url_str):
+    if not url_matches_allowlist(url_str, CN_ALLOWED_DOMAIN_REGEXES):
         error_msg = f'Invalid URL: {url_str}. URL must be from the docs.amazonaws.cn domain'
         await ctx.error(error_msg)
         return error_msg
-    if not url_str.endswith('.html'):
-        error_msg = f'Invalid URL: {url_str}. URL must end with .html'
+    page_url = to_html_page_url(url_str)
+    if page_url is None:
+        error_msg = f'Invalid URL: {url_str}. URL must end with .html or .md'
         await ctx.error(error_msg)
         return error_msg
+    url_str = page_url
 
-    return await read_documentation_impl(ctx, url_str, max_length, start_index, SESSION_UUID)
+    return await read_documentation_impl(
+        ctx, url_str, max_length, start_index, SESSION_UUID, CN_ALLOWED_DOMAIN_REGEXES
+    )
 
 
 @mcp.tool()
@@ -163,7 +176,9 @@ async def get_available_services(
 
     toc_url_str = 'https://docs.amazonaws.cn/en_us/aws/latest/userguide/toc-contents.json'
     toc_url_with_session = f'{toc_url_str}?session={SESSION_UUID}'
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(
+        event_hooks={'response': [enforce_redirect_allowlist(CN_ALLOWED_DOMAIN_REGEXES)]}
+    ) as client:
         try:
             response = await client.get(
                 url_with_session,
@@ -226,7 +241,12 @@ async def get_available_services(
         )
 
     if is_html_content(page_raw, content_type):
-        content = extract_content_from_html(page_raw)
+        try:
+            content = extract_content_from_html(page_raw)
+        except UnreadablePageError as e:
+            logger.error(f'Failed to read {url_str}: {e}')
+            await ctx.error(f'Failed to read {url_str}: {e}')
+            content = f'Note: {e}'
     else:
         content = page_raw
 

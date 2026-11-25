@@ -132,6 +132,52 @@ For write operations, we recommend the following IAM policies:
 
 * AWSGlueServiceRole: Enables Glue service operations including job execution, crawler runs, and data catalog modifications
 
+### IAM Role Management Permissions
+The `create_data_processing_role` and `add_inline_policy` tools manage IAM roles and policies in your account. They are only available with `--allow-write` and require the following IAM permissions, which are **not** included in AWSGlueServiceRole. Grant them only if you plan to use these tools:
+
+| Tool | Required IAM actions |
+|------|----------------------|
+| create_data_processing_role | `iam:CreateRole`, `iam:AttachRolePolicy` (when `managed_policy_arns` is set), `iam:PutRolePolicy` (when `inline_policy` is set) |
+| add_inline_policy | `iam:GetRolePolicy`, `iam:PutRolePolicy` |
+
+We recommend scoping these permissions to a role name prefix and to the managed policies the server supports. For example:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["iam:CreateRole", "iam:PutRolePolicy", "iam:GetRolePolicy"],
+      "Resource": "arn:aws:iam::<account-id>:role/<role-prefix>*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "iam:AttachRolePolicy",
+      "Resource": "arn:aws:iam::<account-id>:role/<role-prefix>*",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": [
+            "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole",
+            "arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole",
+            "arn:aws:iam::aws:policy/service-role/AmazonEMRServicePolicy_v2",
+            "arn:aws:iam::aws:policy/AmazonAthenaFullAccess"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+The server also applies the following restrictions to these tools:
+* `create_data_processing_role` only attaches the AWS managed policies supported for the selected service type:
+  * glue: `AWSGlueServiceRole`
+  * emr: `AmazonElasticMapReduceRole`, `AmazonEMRServicePolicy_v2`
+  * athena: `AmazonAthenaFullAccess`
+* Inline policies (`inline_policy` and `add_inline_policy`) cannot use `NotAction` in Allow statements, cannot grant `*` or wildcard service prefixes, and can only include the IAM actions `iam:PassRole`, `iam:GetRole` and `iam:ListRoles`.
+
+
 **Important Security Note**: Users should exercise caution when --allow-write and --allow-sensitive-data-access modes are enabled with these broad permissions, as this combination grants significant privileges to the MCP server. Only enable these flags when necessary and in trusted environments.
 
 **Resource Management Limitation**: The DataProcessing MCP Server can only update or delete resources that were originally created through it. Resources created by other means cannot be modified or deleted using the DataProcessing MCP Server.
@@ -271,21 +317,41 @@ Enables write access mode, which allows mutating operations (e.g., create, updat
 * Default: false (The server runs in read-only mode by default)
 * Example: Add `--allow-write` to the `args` list in your MCP server definition.
 
+**Security: Read-only query enforcement (Athena)**
+
+When `--allow-write` is not set, the Athena query handler uses an allowlist to determine which SQL statements are permitted. Only explicitly recognized read-only operations are allowed:
+
+* `SELECT`, `WITH` (CTEs), `SHOW`, `DESCRIBE`/`DESC`, `EXPLAIN`, `ANALYZE`
+
+CTEs (`WITH ... SELECT`) are read-only only when the entire statement is a read. CTEs followed by write operations (e.g., `WITH cte AS (...) INSERT INTO ...`) are rejected.
+
+All other statements (including `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `UNLOAD`, etc.) are blocked. If your workload requires statements beyond the read-only allowlist, enable `--allow-write`.
+
 #### `--allow-sensitive-data-access` (optional)
 
-Enables access to operations that expose sensitive user data. When disabled (default), the following operations are restricted:
+Enables access to sensitive user data. When disabled (default), the flag is enforced two ways, depending on what the operation returns.
 
-**CRITICAL - Database Credentials:**
-* `get-connection` and `list-connections`: Automatically enforces `hide_password=True` to prevent exposure of plaintext database passwords in connection properties
+**Refused outright**, because the response is itself customer data and filtering would leave nothing meaningful:
 
-**HIGH - User Data:**
-* `get-query-results` (Athena): Blocks retrieval of actual query result data
-* `get-statement` (Glue Interactive Sessions): Blocks retrieval of statement execution outputs
-* `get-entity-records` (Data Catalog): Blocks retrieval of preview data from connected sources
+* `get-query-results` (Athena): query result data
+* `get-entity-records` (Data Catalog): preview data from connected sources
 
-**MEDIUM - Job Outputs and Logs:**
-* `get-job-run` (Glue ETL & EMR Serverless): Blocks access to job run details that may contain sensitive arguments and error messages
-* `describe-step` (EMR EC2): Blocks access to step configurations and error details
+**Answered with sensitive fields omitted**, so the operation stays usable for discovery and monitoring while the sensitive fields are withheld:
+
+| Operations | Omitted without the flag | Still returned |
+| --- | --- | --- |
+| `describe-step`, `list-steps` (EMR EC2) | `Config.Args`, `Config.Properties`, `Status.StateChangeReason.Message`, `Status.FailureDetails` | step id, name, state, timeline, jar, execution role |
+| `get-job-run`, `get-job-runs` (Glue ETL) | `Arguments`, `ErrorMessage`, `StateDetail` | run id, job name, state, timings, capacity, worker config |
+| `get-statement`, `list-statements` (Glue Interactive Sessions) | `Code`, `Output.Data`, `Output.ErrorValue`, `Output.Traceback` | statement id, state, progress, timings |
+| `get-job-run`, `list-job-runs` (EMR Serverless) | `jobDriver`, `configurationOverrides`, `tags`, `stateDetails` | run id, application id, state, timings, execution role |
+
+**Redacted by the AWS API:**
+
+* `get-connection` and `list-connections`: enforces `hide_password=True` so plaintext passwords are never returned in connection properties
+
+When fields are omitted, the response message names them and points at this flag, so a caller can tell the difference between a field that was empty and one that was withheld.
+
+Both the singular and list form of an operation are treated identically, because the AWS APIs behind them return the same records: Glue `GetJobRuns` returns full `JobRun` entries, Glue `ListStatements` returns full `Statement` entries including output data, and EMR `ListSteps` returns step arguments and state-change messages. Filtering only the singular form would make the flag mean different things depending on which form was called. Operations returning only identifiers, such as Athena `list-query-executions`, are unaffected.
 
 * Default: false (Access to sensitive data is restricted by default)
 * Security Note: Only enable this flag in trusted environments when you need access to actual data
@@ -368,7 +434,7 @@ Controls whether the MCP server adds and verifies MCP-managed tags on resources.
 | Tool Name | Description | Key Operations | Requirements |
 |-----------|-------------|----------------|--------------|
 | manage_aws_glue_sessions | Manage AWS Glue Interactive Sessions for Spark and Ray workloads | create-session, delete-session, get-session, list-sessions, stop-session | --allow-write flag for create/delete/stop operations, appropriate AWS permissions |
-| manage_aws_glue_statements | Execute and manage code statements within Glue Interactive Sessions | run-statement, cancel-statement, get-statement, list-statements | --allow-write flag for run/cancel operations, active session required |
+| manage_aws_glue_statements | Execute and manage code statements within Glue Interactive Sessions | run-statement, cancel-statement, get-statement, list-statements | --allow-write flag for run/cancel operations, --allow-sensitive-data-access flag to receive statement code and execution output from get-statement and list-statements, active session required |
 
 ### Glue Workflows and Triggers Handler Tools
 
@@ -394,14 +460,14 @@ Controls whether the MCP server adds and verifies MCP-managed tags on resources.
 
 | Tool Name | Description | Key Operations | Requirements |
 |-----------|-------------|----------------|--------------|
-| manage_aws_emr_ec2_steps | Manage Amazon EMR steps for processing data on EMR clusters | add-steps, cancel-steps, describe-step, list-steps | --allow-write flag for add/cancel operations, appropriate AWS permissions |
+| manage_aws_emr_ec2_steps | Manage Amazon EMR steps for processing data on EMR clusters | add-steps, cancel-steps, describe-step, list-steps | --allow-write flag for add/cancel operations, --allow-sensitive-data-access flag to receive step arguments and failure text from describe-step and list-steps, appropriate AWS permissions |
 
 ### EMR Serverless Handler Tools
 
 | Tool Name | Description | Key Operations | Requirements |
 |-----------|-------------|----------------|--------------|
 | manage_aws_emr_serverless_applications | Manage Amazon EMR Serverless applications with comprehensive lifecycle control | create-application, get-application, update-application, delete-application, list-applications, start-application, stop-application | --allow-write flag for create/update/delete/start/stop operations, appropriate AWS permissions |
-| manage_aws_emr_serverless_job_runs | Manage Amazon EMR Serverless job runs for executing data processing workloads | start-job-run, get-job-run, cancel-job-run, list-job-runs, get-dashboard-for-job-run | --allow-write flag for start/cancel operations, application must exist, appropriate AWS permissions |
+| manage_aws_emr_serverless_job_runs | Manage Amazon EMR Serverless job runs for executing data processing workloads | start-job-run, get-job-run, cancel-job-run, list-job-runs, get-dashboard-for-job-run | --allow-write flag for start/cancel operations, --allow-sensitive-data-access flag to receive job driver, overrides, tags and failure details from get-job-run and list-job-runs, application must exist, appropriate AWS permissions |
 
 ### Athena Query Handler Tools
 
@@ -437,7 +503,7 @@ Controls whether the MCP server adds and verifies MCP-managed tags on resources.
 
 | Tool Name | Description | Key Operations | Requirements |
 |-----------|-------------|----------------|--------------|
-| manage_aws_glue_jobs | Manage AWS Glue ETL jobs and job runs | create-job, delete-job, get-job, get-jobs, update-job, start-job-run, stop-job-run, get-job-run, get-job-runs, batch-stop-job-run, get-job-bookmark, reset-job-bookmark | --allow-write flag for create/delete/update/start/stop operations, appropriate AWS permissions |
+| manage_aws_glue_jobs | Manage AWS Glue ETL jobs and job runs | create-job, delete-job, get-job, get-jobs, update-job, start-job-run, stop-job-run, get-job-run, get-job-runs, batch-stop-job-run, get-job-bookmark, reset-job-bookmark | --allow-write flag for create/delete/update/start/stop operations, --allow-sensitive-data-access flag to receive job arguments and error messages from get-job-run and get-job-runs, appropriate AWS permissions |
 
 ### Glue Crawler Handler Tools
 
@@ -454,9 +520,9 @@ Controls whether the MCP server adds and verifies MCP-managed tags on resources.
 
 | Tool Name | Description | Key Operations | Requirements |
 |-----------|-------------|----------------|--------------|
-| add_inline_policy | Add a new inline policy to an IAM role | Create inline policies with custom permissions for data processing services | --allow-write flag, role must exist, policy name must be unique |
+| add_inline_policy | Add a new inline policy to an IAM role | Create inline policies with custom permissions for data processing services | --allow-write flag, role must exist, policy name must be unique, `iam:PutRolePolicy` permission |
 | get_policies_for_role | Get all policies attached to an IAM role | Retrieve managed and inline policies, assume role policy document, role metadata | Role must exist, valid AWS credentials |
-| create_data_processing_role | Create a new IAM role for data processing services | Create roles for Glue/EMR/Athena with trust relationships, attach managed policies, add inline policies | --allow-write flag, unique role name, valid service type (glue/emr/athena) |
+| create_data_processing_role | Create a new IAM role for data processing services | Create roles for Glue/EMR/Athena with trust relationships, attach managed policies, add inline policies | --allow-write flag, unique role name, valid service type (glue/emr/athena), supported managed policies only, `iam:CreateRole` / `iam:AttachRolePolicy` / `iam:PutRolePolicy` permissions |
 | get_roles_for_service | Get all IAM roles that can be assumed by a specific AWS service | List roles with trust relationships for Glue/EMR/Athena services, filter by service principal | Valid AWS credentials, service type parameter |
 
 #### S3 Management Tools

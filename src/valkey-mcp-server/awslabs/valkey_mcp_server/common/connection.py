@@ -12,89 +12,198 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+"""Valkey GLIDE connection manager."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
 from awslabs.valkey_mcp_server.common.config import VALKEY_CFG
-from awslabs.valkey_mcp_server.version import __version__
-from typing import Optional, Type, Union
-from valkey import (
-    Valkey,
-    exceptions,
+from glide import (
+    AdvancedGlideClientConfiguration,
+    AdvancedGlideClusterClientConfiguration,
+    BackoffStrategy,
+    GlideClient,
+    GlideClientConfiguration,
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
+    IamAuthConfig,
+    NodeAddress,
+    ServerCredentials,
+    ServiceType,
 )
-from valkey.cluster import ValkeyCluster
 
 
-class ValkeyConnectionManager:
-    """Manages connection to Valkey."""
+logger = logging.getLogger(__name__)
 
-    _instance: Optional[Union[Valkey, ValkeyCluster]] = None
+GlideClientType = GlideClient | GlideClusterClient
 
-    @classmethod
-    def get_connection(cls, decode_responses: bool = True) -> Union[Valkey, ValkeyCluster]:
-        """Create connection to Valkey if none present or returns existing connection.
+_client: GlideClientType | None = None
 
-        Args:
-            decode_responses: Whether to decode response bytes to strings. Defaults to True.
 
-        Returns:
-            Valkey: A Valkey connection instance.
-        """
-        if cls._instance is None:
-            try:
-                valkey_class: Type[Union[Valkey, ValkeyCluster]] = (
-                    ValkeyCluster if VALKEY_CFG['cluster_mode'] else Valkey
-                )
+def _resolve_region() -> str:
+    """Resolve the AWS region used to sign ElastiCache IAM auth tokens.
 
-                # Get SSL settings with defaults
-                ssl_enabled = VALKEY_CFG.get('ssl', False)
-                ssl_cert_reqs = VALKEY_CFG.get('ssl_cert_reqs')
-                if ssl_enabled and ssl_cert_reqs is None:
-                    ssl_cert_reqs = 'required'
+    Uses VALKEY_REGION / AWS_REGION / AWS_DEFAULT_REGION (captured in
+    VALKEY_CFG['region']), and falls back to the boto3 default session (shared config,
+    AWS_PROFILE, and so on).
+    """
+    region = VALKEY_CFG.get('region')
+    if not region:
+        import boto3.session
 
-                # Build connection kwargs
-                connection_kwargs = {
-                    'host': VALKEY_CFG['host'],
-                    'port': VALKEY_CFG['port'],
-                    'username': VALKEY_CFG.get('username'),
-                    'password': VALKEY_CFG.get('password', ''),
-                    'ssl': ssl_enabled,
-                    'ssl_ca_path': VALKEY_CFG.get('ssl_ca_path'),
-                    'ssl_keyfile': VALKEY_CFG.get('ssl_keyfile'),
-                    'ssl_certfile': VALKEY_CFG.get('ssl_certfile'),
-                    'ssl_cert_reqs': ssl_cert_reqs,
-                    'ssl_ca_certs': VALKEY_CFG.get('ssl_ca_certs'),
-                    'decode_responses': decode_responses,
-                    'lib_name': f'valkey-py(mcp-server_v{__version__})',
+        region = boto3.session.Session().region_name
+    if not region:
+        raise ValueError(
+            'VALKEY_REGION is required when VALKEY_IAM_AUTH is enabled '
+            '(set it to the region of the ElastiCache cache)'
+        )
+    return region
+
+
+def _build_credentials() -> ServerCredentials | None:
+    """Build GLIDE server credentials from VALKEY_CFG.
+
+    Two modes:
+    - IAM authentication (VALKEY_IAM_AUTH=true): required for Amazon ElastiCache serverless
+      caches with a public endpoint. GLIDE generates the SigV4 IAM auth token from the
+      default AWS credential chain and refreshes it before the 15-minute expiry, so no token
+      handling is needed here. VALKEY_PWD is ignored in this mode.
+    - Password authentication (default): VALKEY_PWD with optional VALKEY_USERNAME.
+    """
+    username = VALKEY_CFG.get('username')
+
+    if VALKEY_CFG.get('iam_auth', False):
+        cache_name = VALKEY_CFG.get('cache_name')
+        if not username:
+            raise ValueError(
+                'VALKEY_USERNAME (the IAM-enabled ElastiCache user id, e.g. default.iam-user) '
+                'is required when VALKEY_IAM_AUTH is enabled'
+            )
+        if not cache_name:
+            raise ValueError(
+                'VALKEY_CACHE_NAME (the ElastiCache cache name the IAM token is signed for) '
+                'is required when VALKEY_IAM_AUTH is enabled'
+            )
+        if '.' in cache_name:
+            raise ValueError(
+                'Invalid VALKEY_CACHE_NAME: expected the cache name, not an endpoint address'
+            )
+        if VALKEY_CFG.get('password'):
+            logger.warning('VALKEY_PWD is ignored because VALKEY_IAM_AUTH is enabled')
+        return ServerCredentials(
+            username=username,
+            iam_config=IamAuthConfig(
+                cluster_name=cache_name.lower(),
+                service=ServiceType.ELASTICACHE,
+                region=_resolve_region(),
+            ),
+        )
+
+    password = VALKEY_CFG.get('password', '')
+    if password:
+        return ServerCredentials(password, username) if username else ServerCredentials(password)
+    return None
+
+
+def _build_config() -> GlideClientConfiguration | GlideClusterClientConfiguration:
+    """Build GLIDE client configuration from VALKEY_CFG."""
+    addresses = [NodeAddress(VALKEY_CFG['host'], VALKEY_CFG['port'])]
+
+    credentials = _build_credentials()
+    iam_auth = VALKEY_CFG.get('iam_auth', False)
+    use_tls = bool(VALKEY_CFG.get('ssl', False)) or iam_auth
+    if iam_auth and not VALKEY_CFG.get('ssl', False):
+        logger.info('TLS enabled automatically because VALKEY_IAM_AUTH is enabled')
+
+    reconnect = BackoffStrategy(num_of_retries=10, factor=500, exponent_base=2, jitter_percent=20)
+
+    kwargs: dict = {
+        'addresses': addresses,
+        'use_tls': use_tls,
+        'request_timeout': 5000,
+        'reconnect_strategy': reconnect,
+        'client_name': 'valkey-mcp-server',
+    }
+    if credentials:
+        kwargs['credentials'] = credentials
+
+    # Wire TLS certificate config if CA certs path is provided
+    if use_tls and VALKEY_CFG.get('ssl_ca_certs'):
+        from glide_shared.config import TlsAdvancedConfiguration
+
+        ca_path = VALKEY_CFG['ssl_ca_certs']
+        try:
+            with open(ca_path, 'rb') as f:
+                ca_cert = f.read()
+        except (FileNotFoundError, PermissionError) as e:
+            raise ValueError(f'Failed to read TLS CA certificate at {ca_path}: {e}') from e
+        if VALKEY_CFG['cluster_mode']:
+            kwargs['advanced_config'] = AdvancedGlideClusterClientConfiguration(
+                tls_config=TlsAdvancedConfiguration(root_pem_cacerts=ca_cert),
+            )
+        else:
+            kwargs['advanced_config'] = AdvancedGlideClientConfiguration(
+                tls_config=TlsAdvancedConfiguration(root_pem_cacerts=ca_cert),
+            )
+
+    if VALKEY_CFG['cluster_mode']:
+        return GlideClusterClientConfiguration(**kwargs)
+    return GlideClientConfiguration(**kwargs)
+
+
+_client_lock = asyncio.Lock()
+
+
+async def get_client() -> GlideClientType:
+    """Get or create the GLIDE client singleton (thread-safe via asyncio.Lock)."""
+    global _client
+    if _client is None:
+        async with _client_lock:
+            if _client is None:  # double-check after acquiring lock
+                config = _build_config()
+                # Configure GLIDE's internal logger (Rust core)
+                from glide import Logger as GlideLogger
+                from glide.logger import Level as GlideLogLevel
+
+                level_map = {
+                    'ERROR': GlideLogLevel.ERROR,
+                    'WARN': GlideLogLevel.WARN,
+                    'INFO': GlideLogLevel.INFO,
+                    'DEBUG': GlideLogLevel.DEBUG,
+                    'TRACE': GlideLogLevel.TRACE,
+                    'OFF': GlideLogLevel.OFF,
                 }
-
-                # Add max_connections parameter based on mode
-                if VALKEY_CFG['cluster_mode']:
-                    connection_kwargs['max_connections_per_node'] = 10
+                glide_level = level_map.get(
+                    VALKEY_CFG.get('glide_log_level', 'WARN'), GlideLogLevel.WARN
+                )
+                GlideLogger.init(glide_level)
+                if isinstance(config, GlideClusterClientConfiguration):
+                    _client = await GlideClusterClient.create(config)
+                    logger.info(
+                        'GLIDE cluster client connected to %s:%s',
+                        VALKEY_CFG['host'],
+                        VALKEY_CFG['port'],
+                    )
                 else:
-                    connection_kwargs['max_connections'] = 10
+                    _client = await GlideClient.create(config)
+                    logger.info(
+                        'GLIDE standalone client connected to %s:%s',
+                        VALKEY_CFG['host'],
+                        VALKEY_CFG['port'],
+                    )
+    return _client
 
-                # Create new instance
-                cls._instance = valkey_class(**connection_kwargs)
 
-            except exceptions.AuthenticationError:
-                print('Authentication failed', file=sys.stderr)
-                raise
-            except exceptions.ConnectionError:
-                print('Failed to connect to Valkey server', file=sys.stderr)
-                raise
-            except exceptions.TimeoutError:
-                print('Connection timed out', file=sys.stderr)
-                raise
-            except exceptions.ResponseError as e:
-                print(f'Response error: {e}', file=sys.stderr)
-                raise
-            except exceptions.ClusterError as e:
-                print(f'Valkey Cluster error: {e}', file=sys.stderr)
-                raise
-            except exceptions.ValkeyError as e:
-                print(f'Valkey error: {e}', file=sys.stderr)
-                raise
-            except Exception as e:
-                print(f'Unexpected error: {e}', file=sys.stderr)
-                raise
+async def close_client() -> None:
+    """Close the GLIDE client if open."""
+    await reset_client()
 
-        return cls._instance
+
+async def reset_client() -> None:
+    """Close and reset client reference (for testing)."""
+    global _client
+    async with _client_lock:
+        if _client is not None:
+            await _client.close()
+        _client = None

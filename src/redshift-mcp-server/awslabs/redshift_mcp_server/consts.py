@@ -15,131 +15,50 @@
 """Redshift MCP Server constants."""
 
 # System
+
+# Access modes for the execute_query tool. Add new modes here and to ACCESS_MODES.
+ACCESS_MODE_READ_ONLY = 'read-only'
+ACCESS_MODE_READ_WRITE = 'read-write'
+ACCESS_MODES = frozenset({ACCESS_MODE_READ_ONLY, ACCESS_MODE_READ_WRITE})
+ACCESS_MODE_DEFAULT = ACCESS_MODE_READ_ONLY
+# Skips the per-write confirmation prompt. Ignored in read-only mode.
+UNSAFE_SKIP_WRITE_CONFIRMATION_DEFAULT = 'false'
+
 CLIENT_CONNECT_TIMEOUT = 60
 CLIENT_READ_TIMEOUT = 600
 CLIENT_RETRIES = {'max_attempts': 5, 'mode': 'adaptive'}
 CLIENT_USER_AGENT_NAME = 'awslabs/mcp/redshift-mcp-server'
-DEFAULT_LOG_LEVEL = 'WARNING'
+LOG_LEVEL_DEFAULT = 'WARNING'
 QUERY_TIMEOUT = 3600
 QUERY_POLL_INTERVAL = 1
-SESSION_KEEPALIVE = 600
-SUSPICIOUS_QUERY_MAX_LEN = 65_536
-SUSPICIOUS_QUERY_TIMEOUT = 1.0
+QUERY_LONG_POLL = 30
 
-# Best practices
+# How long an open transaction may sit idle before Redshift ends it, in seconds. Sent as the
+# Data API's SessionKeepAliveSeconds, whose own ceiling is 86400.
+SESSION_KEEPALIVE_DEFAULT = 600
+SESSION_KEEPALIVE_MAX = 86400
+# How many transactions one caller may hold open at once against one cluster and database.
+MAX_OPEN_TRANSACTIONS_PER_TARGET_DEFAULT = 10
+# How long to keep using the single-statement compatibility path after
+# redshift-data:BatchExecuteStatement was denied, before trying the batch path again.
+FALLBACK_NO_BATCH_REPROBE = 300
 
-CLIENT_BEST_PRACTICES = """
-## AWS Client Best Practices
+# The most rows one statement may return, unless MAX_RESULT_ROWS sets another. A larger result is
+# refused rather than returned whole, which is more than an agent can read, or cut short, which
+# reads as the whole.
+MAX_RESULT_ROWS_DEFAULT = 1000
 
-### Authentication and Configuration
-
-- Default AWS credentials chain (IAM roles, ~/.aws/credentials, etc.).
-- AWS_PROFILE environment variable (if set).
-- Region configuration (in order of precedence):
-  - AWS_REGION environment variable (highest priority)
-  - AWS_DEFAULT_REGION environment variable
-  - Region specified in AWS profile configuration
-
-### Error Handling
-
-- Always print out AWS client errors in full to help diagnose configuration issues.
-- For region-related errors, suggest checking AWS_REGION, AWS_DEFAULT_REGION, or AWS profile configuration.
-- For credential errors, suggest verifying AWS credentials setup and permissions.
-"""
-
-REDSHIFT_BEST_PRACTICES = """
-## Amazon Redshift Best Practices
-
-### Query Guidelines
-
-- Always specify the database and schema when referencing objects to avoid ambiguity.
-- Leverage distribution in WHERE and JOIN predicates and sort keys in ORDER BY for optimal query performance.
-- Use LIMIT clauses for exploratory queries to avoid large result sets.
-- Analyze table to update table statistics if it is not updated or too off before making a decision on the query structure.
-- Prefer explicitly specifying columns in SELECT over "*" for better performance.
-
-### Connection Guidelines
-
-- We are use the Redshift API and Redshift Data API.
-- Leverage IAM authentication when possible instead of secrets (database passwords).
-"""
-
-# SQL queries
-
-SVV_REDSHIFT_DATABASES_QUERY = """
-SELECT
-    database_name,
-    database_owner,
-    database_type,
-    database_acl,
-    database_options,
-    database_isolation_level
-FROM pg_catalog.svv_redshift_databases
-ORDER BY database_name;
-"""
-
-SVV_ALL_SCHEMAS_QUERY = """
-SELECT
-    database_name,
-    schema_name,
-    schema_owner,
-    schema_type,
-    schema_acl,
-    source_database,
-    schema_option
-FROM pg_catalog.svv_all_schemas
-WHERE database_name = :database_name
-ORDER BY schema_name;
-"""
-
-SVV_ALL_TABLES_QUERY = """
-SELECT
-    database_name,
-    schema_name,
-    table_name,
-    table_acl,
-    table_type,
-    remarks
-FROM pg_catalog.svv_all_tables
-WHERE database_name = :database_name AND schema_name = :schema_name
-ORDER BY table_name;
-"""
-
-SVV_ALL_COLUMNS_QUERY = """
-SELECT
-    database_name,
-    schema_name,
-    table_name,
-    column_name,
-    ordinal_position,
-    column_default,
-    is_nullable,
-    data_type,
-    character_maximum_length,
-    numeric_precision,
-    numeric_scale,
-    remarks
-FROM pg_catalog.svv_all_columns
-WHERE database_name = :database_name AND schema_name = :schema_name AND table_name = :table_name
-ORDER BY ordinal_position;
-"""
+# How many pages of one result set to read before giving up on the paging ending. Not a limit on
+# the result, which MAX_RESULT_ROWS is. This bounds the loop, which a service handing back a fresh
+# token forever would otherwise never leave, and pages without rows never reach the row cap. Far
+# above any real result, since reaching it discards everything read.
+MAX_RESULT_PAGES = 10_000
 
 # SQL guardrails
 
-# Single-lines comments.
-re_slc = r'--.*?$'
+# Maximum SQL length accepted before parsing; longer input is rejected (fail closed).
+MAX_SQL_LEN = 65_536
 
-
-def re_mlc(g: int) -> str:
-    """Multi-line comments, considering balanced recursion."""
-    return rf'(?P<mlc{g}>(?:\/\*)(?:[^\/\*]|\/[^\*]|\*[^\/]|(?P>mlc{g}))*(?:\*\/))'
-
-
-def re_sp(g: int) -> str:
-    """Whitespaces, comments, semicolons which can occur between words."""
-    return rf'({re_slc}|{re_mlc(g)}|\s|;)'
-
-
-# We consider `(END|COMMIT|ROLLBACK|ABORT) [WORK|TRANSACTION]` as a breaker for the `BEGIN READ ONLY; {sql}; END;`
-# guarding wrapper, having there might be variations of whitespaces and comments in the construct.
-SUSPICIOUS_QUERY_REGEXP = rf'(?im)(^|;){re_sp(1)}*(END|COMMIT|ROLLBACK|ABORT)({re_sp(2)}+(WORK|TRANSACTION))?{re_sp(3)}*;'
+# How long the stored discovery answers every lookup, a cluster's absence included, before the
+# control plane is asked again.
+CLUSTER_RESOLVE_TTL = 300

@@ -15,11 +15,21 @@
 """Validation utilities for workflow management."""
 
 import posixpath
+from awslabs.aws_healthomics_mcp_server.consts import (
+    ERROR_INVALID_SESSION_POLICY,
+    SESSION_POLICY_MAX_LENGTH,
+)
 from awslabs.aws_healthomics_mcp_server.models import ContainerRegistryMap, DefinitionRepository
 from awslabs.aws_healthomics_mcp_server.utils.content_resolver import resolve_single_content
+from awslabs.aws_healthomics_mcp_server.utils.local_file_access import (
+    LocalFileAccessDisabledError,
+    is_local_file_access_allowed,
+    looks_like_local_path,
+    require_local_file_access,
+)
 from enum import Enum
 from loguru import logger
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 from pydantic import ValidationError
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -50,6 +60,12 @@ def detect_readme_input_type(readme: str) -> ReadmeInputType:
     2. If path exists and ends with '.md' -> LOCAL_FILE
     3. Otherwise -> MARKDOWN_CONTENT
 
+    When local file access is disabled (network transports), rule 2 is instead a
+    pure string check (``looks_like_local_path``) that never touches the
+    filesystem and has no ``.md`` precondition, so any obvious path attempt such
+    as ``/etc/passwd`` is classified LOCAL_FILE and validate_readme_input rejects
+    it. Multi-line markdown stays MARKDOWN_CONTENT.
+
     Args:
         readme: The README input string
 
@@ -62,8 +78,11 @@ def detect_readme_input_type(readme: str) -> ReadmeInputType:
     if readme.startswith('s3://'):
         return ReadmeInputType.S3_URI
 
-    # Rule 2: Check for existing local file with .md extension
-    if readme.lower().endswith('.md') and os.path.isfile(readme):
+    # Rule 2: Check for a local file (an obvious path attempt when access is disabled)
+    if not is_local_file_access_allowed():
+        if looks_like_local_path(readme):
+            return ReadmeInputType.LOCAL_FILE
+    elif readme.lower().endswith('.md') and os.path.isfile(readme):
         return ReadmeInputType.LOCAL_FILE
 
     # Rule 3: Default to markdown content
@@ -125,6 +144,68 @@ def parse_tags(tags: Any) -> Dict[str, str]:
             raise ValueError('Tags JSON must be an object, e.g. {"key": "value"}')
         return parsed
     raise ValueError(f'Tags must be a JSON string or dict, got {type(tags).__name__}')
+
+
+def normalize_session_policy(session_policy: Any) -> Optional[str]:
+    """Normalize a session policy into the compact JSON string expected by HealthOmics.
+
+    MCP clients may send the policy as a JSON string or as a native dict object.
+    Both are re-serialized compactly so whitespace does not count against the
+    SESSION_POLICY_MAX_LENGTH limit. Only the shape (non-empty JSON object) and
+    length are checked locally; IAM policy semantics are validated by the service.
+
+    Args:
+        session_policy: Inline IAM policy as a JSON string or a dict, or None.
+            An unresolved pydantic FieldInfo default (direct invocation) is treated as None.
+
+    Returns:
+        The session policy as a compact JSON string, or None if not provided.
+
+    Raises:
+        ValueError: If the policy is not a JSON object, is empty, is not JSON
+            serializable, exceeds SESSION_POLICY_MAX_LENGTH characters, or is an
+            unsupported type.
+    """
+    import json
+    from pydantic.fields import FieldInfo
+
+    if session_policy is None or isinstance(session_policy, FieldInfo):
+        return None
+
+    if isinstance(session_policy, dict):
+        parsed = session_policy
+    elif isinstance(session_policy, str):
+        try:
+            parsed = json.loads(session_policy)
+        except json.JSONDecodeError as e:
+            raise ValueError(ERROR_INVALID_SESSION_POLICY.format(f'not valid JSON ({e})')) from e
+        if not isinstance(parsed, dict):
+            raise ValueError(ERROR_INVALID_SESSION_POLICY.format('must be a JSON object'))
+    else:
+        raise ValueError(
+            ERROR_INVALID_SESSION_POLICY.format(
+                f'must be a JSON string or dict, got {type(session_policy).__name__}'
+            )
+        )
+
+    if not parsed:
+        raise ValueError(ERROR_INVALID_SESSION_POLICY.format('must not be empty'))
+
+    try:
+        policy_str = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            ERROR_INVALID_SESSION_POLICY.format(f'not JSON serializable ({e})')
+        ) from e
+
+    if len(policy_str) > SESSION_POLICY_MAX_LENGTH:
+        raise ValueError(
+            ERROR_INVALID_SESSION_POLICY.format(
+                f'length {len(policy_str)} exceeds the maximum of '
+                f'{SESSION_POLICY_MAX_LENGTH} characters'
+            )
+        )
+    return policy_str
 
 
 def parse_id_list(value: Any) -> list:
@@ -485,6 +566,12 @@ async def validate_readme_input(
         return (None, readme)
 
     elif input_type == ReadmeInputType.LOCAL_FILE:
+        try:
+            require_local_file_access()
+        except LocalFileAccessDisabledError as e:
+            logger.error(str(e))
+            await ctx.error(str(e))
+            raise
         # Read file contents with proper error handling
         try:
             with open(readme, 'r', encoding='utf-8') as f:
@@ -587,6 +674,36 @@ async def validate_provider_type(
         raise ValueError(error_message)
 
     return provider_type
+
+
+async def validate_workflow_type(
+    ctx: Context,
+    workflow_type: Optional[str],
+) -> Optional[str] | Dict[str, Any]:
+    """Validate that workflow_type is a supported value.
+
+    Args:
+        ctx: MCP context for error reporting
+        workflow_type: The workflow type to validate (PRIVATE or READY2RUN)
+
+    Returns:
+        The validated workflow type string, None if not provided,
+        or an error dict if validation fails (via handle_tool_error)
+    """
+    from awslabs.aws_healthomics_mcp_server.models.core import GetWorkflowType
+    from awslabs.aws_healthomics_mcp_server.utils.error_utils import handle_tool_error
+
+    if workflow_type is None:
+        return None
+
+    valid_types = [wt.value for wt in GetWorkflowType]
+    if workflow_type not in valid_types:
+        error_message = (
+            f"Invalid workflow type '{workflow_type}'. Must be one of: {', '.join(valid_types)}"
+        )
+        return await handle_tool_error(ctx, ValueError(error_message), 'Invalid workflow type')
+
+    return workflow_type
 
 
 async def validate_connection_arn(

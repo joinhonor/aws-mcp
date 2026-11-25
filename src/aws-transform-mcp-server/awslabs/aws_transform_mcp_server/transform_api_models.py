@@ -174,9 +174,17 @@ class WorkspaceMetadata(FESRequest):
     workspaceId: Optional[str] = None
 
 
+class ChatEngagementMetadata(FESRequest):
+    """Engagement metadata for chat resourcesOnScreen."""
+
+    engagementId: Optional[str] = None
+    focusState: Optional[str] = None
+
+
 class ResourcesOnScreen(FESRequest):
     """Top-level resourcesOnScreen wrapper for chat metadata."""
 
+    engagement: Optional[ChatEngagementMetadata] = None
     workspace: Optional[WorkspaceMetadata] = None
 
 
@@ -337,6 +345,7 @@ StepIdFilter.model_rebuild()
 class BatchGetMessageRequest(FESRequest):
     """Request model for BatchGetMessage."""
 
+    engagementId: Optional[str] = None
     messageIds: List[str]
     workspaceId: Optional[str] = None
 
@@ -397,7 +406,6 @@ class CreateJobRequest(FESRequest):
     idempotencyToken: Optional[str] = None
     intent: str
     jobName: str
-    jobType: Optional[str] = None
     objective: str
     orchestratorAgent: Optional[str] = None
     workspaceId: str

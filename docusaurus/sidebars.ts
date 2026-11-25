@@ -79,6 +79,7 @@ const sidebars: SidebarsConfig = {
             "servers/aws-bedrock-custom-model-import-mcp-server",
             "servers/amazon-bedrock-agentcore-mcp-server",
             "servers/sagemaker-ai-mcp-server",
+            "servers/roda-mcp-server"
           ],
         },
         {
@@ -94,6 +95,7 @@ const sidebars: SidebarsConfig = {
             "servers/amazon-keyspaces-mcp-server",
             "servers/amazon-neptune-mcp-server",
             "servers/aurora-dsql-mcp-server",
+            "servers/db2-mcp-server",
             "servers/mssql-mcp-server",
             "servers/mysql-mcp-server",
             "servers/oracle-mcp-server",
@@ -104,7 +106,9 @@ const sidebars: SidebarsConfig = {
             "servers/aws-appsync-mcp-server",
             "servers/aws-iot-sitewise-mcp-server",
             "servers/sagemaker-unified-studio-spark-troubleshooting-mcp-server",
-            "servers/sagemaker-unified-studio-spark-upgrade-mcp-server"
+            "servers/sagemaker-unified-studio-spark-upgrade-mcp-server",
+            "servers/roda-mcp-server"
+
           ],
         },
         {
@@ -146,6 +150,7 @@ const sidebars: SidebarsConfig = {
             "servers/aws-healthomics-mcp-server",
             "servers/healthimaging-mcp-server",
             "servers/healthlake-mcp-server",
+            "servers/roda-mcp-server"
           ],
         },
       ],

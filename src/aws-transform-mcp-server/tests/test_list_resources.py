@@ -864,25 +864,20 @@ class TestListResourcesHandler:
     @patch(
         'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available', return_value=True
     )
-    async def test_plan_merges_results(self, _, mock_fes, handler, ctx):
-        async def fes_side_effect(op, body):
-            if op == 'ListJobPlanSteps':
-                return {'steps': [{'id': 's1'}], 'nextToken': 'steps-tok'}
-            return {'updates': [{'id': 'u1'}], 'nextToken': 'updates-tok'}
-
-        mock_fes.side_effect = fes_side_effect
+    async def test_plan_returns_steps(self, _, mock_fes, handler, ctx):
+        mock_fes.return_value = {'steps': [{'id': 's1'}], 'nextToken': 'steps-tok'}
         result = await handler.list_resources(
             ctx, resource=ResourceType.plan, workspaceId='ws1', jobId='j1'
         )
         parsed = _parse_result(result)
         assert parsed['success'] is True
         assert 'planSteps' in parsed['data']
-        assert 'planUpdates' in parsed['data']
+        assert 'planUpdates' not in parsed['data']
         assert parsed['data']['stepsNextToken'] == 'steps-tok'
-        assert parsed['data']['updatesNextToken'] == 'updates-tok'
         # Nested nextToken should be stripped
         assert 'nextToken' not in parsed['data']['planSteps']
-        assert 'nextToken' not in parsed['data']['planUpdates']
+        args = mock_fes.await_args.args
+        assert args[0] == 'ListJobPlanSteps'
 
     @pytest.mark.asyncio
     @patch(
@@ -892,8 +887,9 @@ class TestListResourcesHandler:
     @patch(
         'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available', return_value=True
     )
-    async def test_plan_both_fail(self, _, mock_fes, handler, ctx):
-        mock_fes.side_effect = RuntimeError('api down')
+    async def test_plan_no_steps_returns_not_found(self, _, mock_fes, handler, ctx):
+        """A planless job returns empty steps (not an error) and maps to NOT_FOUND."""
+        mock_fes.return_value = {'steps': []}
         result = await handler.list_resources(
             ctx, resource=ResourceType.plan, workspaceId='ws1', jobId='j1'
         )
@@ -908,25 +904,65 @@ class TestListResourcesHandler:
     @patch(
         'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available', return_value=True
     )
-    async def test_plan_partial_failure(self, _, mock_fes, handler, ctx):
-        """When one of the two plan calls fails, result includes the other."""
-        call_count = 0
+    async def test_plan_non_dict_response_returns_not_found(self, _, mock_fes, handler, ctx):
+        mock_fes.return_value = None
+        result = await handler.list_resources(
+            ctx, resource=ResourceType.plan, workspaceId='ws1', jobId='j1'
+        )
+        parsed = _parse_result(result)
+        assert parsed['error']['code'] == 'NOT_FOUND'
 
-        async def fes_side_effect(op, body):
-            nonlocal call_count
-            call_count += 1
-            if op == 'ListJobPlanSteps':
-                raise RuntimeError('steps failed')
-            return {'updates': [{'id': 'u1'}]}
-
-        mock_fes.side_effect = fes_side_effect
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.call_transform_api',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available', return_value=True
+    )
+    async def test_plan_last_page_has_no_token(self, _, mock_fes, handler, ctx):
+        mock_fes.return_value = {'steps': [{'id': 's1'}]}
         result = await handler.list_resources(
             ctx, resource=ResourceType.plan, workspaceId='ws1', jobId='j1'
         )
         parsed = _parse_result(result)
         assert parsed['success'] is True
-        assert 'planSteps' not in parsed['data']
-        assert 'planUpdates' in parsed['data']
+        assert 'stepsNextToken' not in parsed['data']
+
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.call_transform_api',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available', return_value=True
+    )
+    async def test_plan_empty_page_with_token_is_not_not_found(self, _, mock_fes, handler, ctx):
+        """An empty page that carries a nextToken keeps paginating instead of NOT_FOUND."""
+        mock_fes.return_value = {'steps': [], 'nextToken': 'more'}
+        result = await handler.list_resources(
+            ctx, resource=ResourceType.plan, workspaceId='ws1', jobId='j1'
+        )
+        parsed = _parse_result(result)
+        assert parsed['success'] is True
+        assert parsed['data']['stepsNextToken'] == 'more'
+
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.call_transform_api',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available', return_value=True
+    )
+    async def test_plan_api_error_returns_failure(self, _, mock_fes, handler, ctx):
+        mock_fes.side_effect = RuntimeError('api down')
+        result = await handler.list_resources(
+            ctx, resource=ResourceType.plan, workspaceId='ws1', jobId='j1'
+        )
+        parsed = _parse_result(result)
+        assert parsed['success'] is False
+        assert parsed['error']['code'] == 'REQUEST_FAILED'
 
     # ── agents ─────────────────────────────────────────────────────────
 
@@ -1142,3 +1178,211 @@ class TestListUsers:
         parsed = _parse_result(result)
         assert parsed['success'] is False
         assert 'searchTerm' in parsed['error']['message']
+
+
+class TestListEngagementResources:
+    @pytest.fixture
+    def handler(self, mock_mcp):
+        return ListResourcesHandler(mock_mcp)
+
+    @pytest.fixture
+    def ctx(self, mock_context):
+        return mock_context
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'resource,kwargs,operation,body,items_key',
+        [
+            (ResourceType.engagements, {}, 'ListEngagements', {}, 'engagements'),
+            (
+                ResourceType.engagement_invitations,
+                {},
+                'ListEngagementInvitations',
+                {},
+                'invitations',
+            ),
+            (
+                ResourceType.engagement_tenants,
+                {'engagementId': 'e-1'},
+                'ListEngagementTenants',
+                {'engagementId': 'e-1'},
+                'tenants',
+            ),
+            (
+                ResourceType.engagement_users,
+                {'engagementId': 'e-1'},
+                'ListEngagementUsers',
+                {'engagementId': 'e-1'},
+                'users',
+            ),
+            (
+                ResourceType.engagement_workspaces,
+                {'engagementId': 'e-1'},
+                'ListEngagementWorkspaces',
+                {'engagementId': 'e-1'},
+                'workspaces',
+            ),
+            (
+                ResourceType.workspace_engagements,
+                {'workspaceId': 'w-1'},
+                'ListEngagementsForWorkspace',
+                {'workspaceId': 'w-1'},
+                'items',
+            ),
+        ],
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.paginate_all',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available',
+        return_value=True,
+    )
+    async def test_auto_paginated_resource(
+        self,
+        _,
+        mock_paginate,
+        resource,
+        kwargs,
+        operation,
+        body,
+        items_key,
+        handler,
+        ctx,
+    ):
+        mock_paginate.return_value = {items_key: [{'id': 'item-1'}]}
+
+        result = await handler.list_resources(ctx, resource=resource, **kwargs)
+
+        assert _parse_result(result)['data']['items'] == [{'id': 'item-1'}]
+        mock_paginate.assert_awaited_once_with(operation, body, items_key)
+
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.paginate_all',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available',
+        return_value=True,
+    )
+    async def test_engagement_users_include_filters(self, _, mock_paginate, handler, ctx):
+        mock_paginate.return_value = {'users': [{'userId': 'u-1'}]}
+
+        result = await handler.list_resources(
+            ctx,
+            resource=ResourceType.engagement_users,
+            engagementId='e-1',
+            filterRole='LEAD',
+            filterTenantId='t-1',
+        )
+
+        assert _parse_result(result)['data']['items'] == [{'userId': 'u-1'}]
+        mock_paginate.assert_awaited_once_with(
+            'ListEngagementUsers',
+            {
+                'engagementId': 'e-1',
+                'filterRole': 'LEAD',
+                'filterTenantId': 't-1',
+            },
+            'users',
+        )
+
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.paginate_all',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available',
+        return_value=True,
+    )
+    async def test_engagement_workspaces_include_tenant_filter(
+        self, _, mock_paginate, handler, ctx
+    ):
+        mock_paginate.return_value = {'workspaces': [{'workspaceId': 'w-1'}]}
+
+        result = await handler.list_resources(
+            ctx,
+            resource=ResourceType.engagement_workspaces,
+            engagementId='e-1',
+            filterTenantId='t-1',
+        )
+
+        assert _parse_result(result)['data']['items'] == [{'workspaceId': 'w-1'}]
+        mock_paginate.assert_awaited_once_with(
+            'ListEngagementWorkspaces',
+            {'engagementId': 'e-1', 'filterTenantId': 't-1'},
+            'workspaces',
+        )
+
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.call_transform_api',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available',
+        return_value=True,
+    )
+    async def test_partner_types(self, _, mock_fes, handler, ctx):
+        mock_fes.return_value = {'partnerTypes': ['ISV', 'CONSULTING_PARTNER']}
+
+        result = await handler.list_resources(ctx, resource=ResourceType.partner_types)
+
+        assert _parse_result(result)['data']['items'] == ['ISV', 'CONSULTING_PARTNER']
+        mock_fes.assert_awaited_once_with('ListPartnerTypes', {})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'resource,expected_parameter',
+        [
+            (ResourceType.engagement_tenants, 'engagementId'),
+            (ResourceType.engagement_users, 'engagementId'),
+            (ResourceType.engagement_workspaces, 'engagementId'),
+            (ResourceType.workspace_engagements, 'workspaceId'),
+        ],
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available',
+        return_value=True,
+    )
+    async def test_scoped_engagement_resources_require_id(
+        self, _, resource, expected_parameter, handler, ctx
+    ):
+        result = await handler.list_resources(ctx, resource=resource)
+
+        parsed = _parse_result(result)
+        assert parsed['error']['code'] == 'VALIDATION_ERROR'
+        assert expected_parameter in parsed['error']['message']
+
+    @pytest.mark.asyncio
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.call_transform_api',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'awslabs.aws_transform_mcp_server.tools.list_resources.is_fes_available',
+        return_value=True,
+    )
+    async def test_messages_use_engagement_scope(self, _, mock_fes, handler, ctx):
+        mock_fes.side_effect = [
+            {'messageIds': ['msg-1']},
+            {'messages': [{'messageId': 'msg-1', 'text': 'Hello'}]},
+        ]
+
+        result = await handler.list_resources(
+            ctx,
+            resource=ResourceType.messages,
+            workspaceId='ws-ignored',
+            engagementId='eng-1',
+        )
+
+        assert _parse_result(result)['success'] is True
+        list_body = mock_fes.call_args_list[0][0][1].model_dump(by_alias=True, exclude_none=True)
+        assert list_body['metadata']['resourcesOnScreen'] == {
+            'engagement': {'engagementId': 'eng-1'}
+        }
+        batch_body = mock_fes.call_args_list[1][0][1].model_dump(by_alias=True, exclude_none=True)
+        assert batch_body == {'engagementId': 'eng-1', 'messageIds': ['msg-1']}

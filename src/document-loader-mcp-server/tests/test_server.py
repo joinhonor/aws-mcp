@@ -32,6 +32,7 @@ from awslabs.document_loader_mcp_server.server import (
     validate_output_dir,
 )
 from fastmcp.utilities.types import Image
+from pathlib import Path
 from tests.test_document_parsing import DocumentTestGenerator, MockContext
 from unittest.mock import MagicMock, patch
 
@@ -43,7 +44,7 @@ async def test_server():
 
     # Test getting tools
     try:
-        tools = await mcp.get_tools()
+        tools = await mcp.list_tools()
         print(f'\nAvailable tools ({len(tools)}):')
 
         tool_names = []
@@ -78,7 +79,7 @@ async def test_server():
 async def call_mcp_tool(tool_name: str, file_path: str, file_type: str = None):
     """Helper function to call MCP tools through the server."""
     # Get the tool from the server
-    tools = await mcp.get_tools()
+    tools = {t.name: t for t in await mcp.list_tools()}
 
     if tool_name not in tools:
         raise ValueError(f'Tool {tool_name} not found. Available tools: {list(tools.keys())}')
@@ -145,13 +146,12 @@ async def test_mcp_tool_functions():
     print('✓ read_document (XLSX) tool working')
 
     # Test XLS document using consolidated read_document tool
-    xls_path = (
-        generator.generate_sample_xlsx()
-    )  # Use same generator, just test different file_type
+    xls_path = str(Path(__file__).parent / 'fixtures' / 'test.xls')
     xls_result = await call_mcp_tool('read_document', xls_path, 'xls')
     assert isinstance(xls_result, DocumentReadResponse)
-    assert xls_result.status == 'success'
-    assert len(xls_result.content) > 0
+    assert xls_result.status == 'success', xls_result.error_message
+    assert '## 09060124-b5e7-4717-9d07-3c046eb' in xls_result.content
+    assert '6ff4173b-42a5-4784-9b19-f49caff4d93d' in xls_result.content
     print('✓ read_document (XLS) tool working')
 
     # Test PPTX document using consolidated read_document tool
@@ -904,7 +904,7 @@ async def call_mcp_tool_slides(
     file_path: str, output_dir: str, dpi: int = 200, timeout: int = 120
 ):
     """Helper function to call extract_slides_as_images MCP tool."""
-    tools = await mcp.get_tools()
+    tools = {t.name: t for t in await mcp.list_tools()}
 
     if 'extract_slides_as_images' not in tools:
         raise ValueError('Tool extract_slides_as_images not found')
@@ -926,6 +926,118 @@ def test_get_base_directory_from_env():
         result = _get_base_directory()
         assert result == Path('/custom/base')
         print('✓ _get_base_directory returns path from env var')
+
+
+def test_get_base_directory_defaults_to_cwd_without_env():
+    """Test _get_base_directory defaults to the resolved cwd when unconfigured."""
+    from pathlib import Path
+
+    # Clean environment: no DOCUMENT_BASE_DIR, no ambient CI/test signals.
+    with patch.dict(os.environ, {}, clear=True):
+        result = _get_base_directory()
+        assert result == Path.cwd().resolve()
+        print('✓ _get_base_directory defaults to cwd when unconfigured')
+
+
+@pytest.mark.parametrize(
+    'ambient_env',
+    [
+        {'CI': 'true'},
+        {'GITHUB_ACTIONS': 'true'},
+        {'PYTEST_CURRENT_TEST': 'tests/test_server.py::something (call)'},
+        {'CI': 'true', 'GITHUB_ACTIONS': 'true', 'PYTEST_CURRENT_TEST': 'x'},
+    ],
+)
+def test_get_base_directory_ignores_ambient_ci_env(ambient_env):
+    """Ambient CI/test env vars must NOT widen the sandbox to '/'.
+
+    Regression test for the path-containment bypass: CI platforms set CI /
+    GITHUB_ACTIONS unconditionally and pytest sets PYTEST_CURRENT_TEST, so any
+    of these silently disabling the sandbox is the vulnerability. With no
+    DOCUMENT_BASE_DIR configured, the base directory must remain the secure
+    cwd default regardless of these signals.
+    """
+    from pathlib import Path
+
+    with patch.dict(os.environ, ambient_env, clear=True):
+        result = _get_base_directory()
+        assert result != Path('/')
+        assert result == Path.cwd().resolve()
+        print(f'✓ _get_base_directory ignores ambient env {sorted(ambient_env)}')
+
+
+def test_get_base_directory_explicit_base_wins_over_ci_env():
+    """Explicit DOCUMENT_BASE_DIR is honored even with ambient CI env present."""
+    from pathlib import Path
+
+    env = {
+        'DOCUMENT_BASE_DIR': '/var/app/documents',
+        'CI': 'true',
+        'GITHUB_ACTIONS': 'true',
+        'PYTEST_CURRENT_TEST': 'x',
+    }
+    with patch.dict(os.environ, env, clear=True):
+        result = _get_base_directory()
+        # Compare against the resolved expectation: some system dirs (e.g. /var
+        # on macOS) are symlinks, and _get_base_directory canonicalizes them.
+        assert result == Path('/var/app/documents').resolve()
+        assert result != Path('/')
+        print('✓ explicit DOCUMENT_BASE_DIR wins over ambient CI env')
+
+
+def test_get_base_directory_resolves_symlinks_and_relative_paths():
+    """DOCUMENT_BASE_DIR is resolved to a canonical absolute path."""
+    from pathlib import Path
+
+    # A relative base is resolved against cwd to an absolute path.
+    with patch.dict(os.environ, {'DOCUMENT_BASE_DIR': 'subdir'}, clear=True):
+        result = _get_base_directory()
+        assert result.is_absolute()
+        assert result == (Path.cwd() / 'subdir').resolve()
+        print('✓ _get_base_directory resolves to a canonical absolute path')
+
+
+@pytest.mark.asyncio
+async def test_sandbox_enforced_under_ci_env_end_to_end(tmp_path):
+    """End-to-end: an out-of-base absolute read is denied even with CI env set.
+
+    This exercises the real enforcement path (validate_file_path ->
+    _is_within_base_directory) rather than just the helper, proving the tool
+    surface is sandboxed regardless of ambient CI signals.
+    """
+    from pathlib import Path
+
+    # A real file that exists and has an allowed extension, placed OUTSIDE
+    # the configured base directory.
+    outside_file = tmp_path / 'secret.pdf'
+    outside_file.write_bytes(b'%PDF-1.4 sensitive')
+
+    base_dir = tmp_path / 'sandbox'
+    base_dir.mkdir()
+
+    ctx = MockContext()
+    # DOCUMENT_BASE_DIR points at the sandbox; ambient CI vars are present.
+    env = {
+        'DOCUMENT_BASE_DIR': str(base_dir),
+        'CI': 'true',
+        'GITHUB_ACTIONS': 'true',
+        'PYTEST_CURRENT_TEST': 'x',
+    }
+    with patch.dict(os.environ, env, clear=True):
+        error = validate_file_path(ctx, str(outside_file))
+        assert error is not None
+        assert 'Access denied' in error
+
+        # And a file INSIDE the sandbox passes containment.
+        inside_file = base_dir / 'ok.pdf'
+        inside_file.write_bytes(b'%PDF-1.4 ok')
+        assert validate_file_path(ctx, str(inside_file)) is None
+
+    # Sanity: with no base configured the default remains the resolved cwd
+    # even when CI env vars are present.
+    with patch.dict(os.environ, {'CI': 'true'}, clear=True):
+        assert _get_base_directory() == Path.cwd().resolve()
+    print('✓ sandbox enforced end-to-end under ambient CI env')
 
 
 def test_get_soffice_timeout_default():
@@ -986,8 +1098,9 @@ def test_convert_to_pdf_with_soffice_success():
         with patch('awslabs.document_loader_mcp_server.server._find_soffice') as mock_find:
             mock_find.return_value = '/usr/bin/soffice'
 
-            with patch('awslabs.document_loader_mcp_server.server.subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0)
+            with patch('awslabs.document_loader_mcp_server.server.subprocess.Popen') as mock_popen:
+                mock_popen.return_value = MagicMock(returncode=0)
+                mock_popen.return_value.communicate.return_value = (b'', b'')
 
                 # Create a fake PDF output file that soffice would produce
                 pdf_path = os.path.join(temp_dir, 'test.pdf')
@@ -996,32 +1109,37 @@ def test_convert_to_pdf_with_soffice_success():
 
                 result = _convert_to_pdf_with_soffice('/input/test.pptx', temp_dir)
                 assert result == pdf_path
-                mock_run.assert_called_once()
-                # Verify timeout is passed to subprocess.run
-                call_kwargs = mock_run.call_args[1]
+                mock_popen.assert_called_once()
+                # Verify a timeout is passed to the wait on soffice
+                call_kwargs = mock_popen.return_value.communicate.call_args[1]
                 assert 'timeout' in call_kwargs
                 print('✓ _convert_to_pdf_with_soffice succeeds')
 
 
 def test_convert_to_pdf_with_soffice_custom_timeout():
-    """Test _convert_to_pdf_with_soffice passes custom timeout to subprocess.run."""
+    """Test _convert_to_pdf_with_soffice enforces a custom timeout and stops soffice."""
+    import subprocess
     import tempfile
 
     with tempfile.TemporaryDirectory() as temp_dir:
         with patch('awslabs.document_loader_mcp_server.server._find_soffice') as mock_find:
             mock_find.return_value = '/usr/bin/soffice'
 
-            with patch('awslabs.document_loader_mcp_server.server.subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0)
+            with patch('awslabs.document_loader_mcp_server.server.subprocess.Popen') as mock_popen:
+                with patch(
+                    'awslabs.document_loader_mcp_server.server._kill_process_tree'
+                ) as mock_kill:
+                    mock_popen.return_value.communicate.side_effect = subprocess.TimeoutExpired(
+                        'soffice', 1
+                    )
 
-                pdf_path = os.path.join(temp_dir, 'test.pdf')
-                with open(pdf_path, 'w') as f:
-                    f.write('fake pdf')
-
-                _convert_to_pdf_with_soffice('/input/test.pptx', temp_dir, timeout_seconds=60)
-                call_kwargs = mock_run.call_args[1]
-                assert call_kwargs['timeout'] == 60
-                print('✓ _convert_to_pdf_with_soffice passes custom timeout')
+                    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+                        _convert_to_pdf_with_soffice(
+                            '/input/test.pptx', temp_dir, timeout_seconds=1
+                        )
+                    assert excinfo.value.timeout == 1
+                    mock_kill.assert_called_once_with(mock_popen.return_value)
+                    print('✓ _convert_to_pdf_with_soffice enforces custom timeout')
 
 
 def test_convert_to_pdf_with_soffice_not_found():
@@ -1041,8 +1159,9 @@ def test_convert_to_pdf_with_soffice_no_output():
         with patch('awslabs.document_loader_mcp_server.server._find_soffice') as mock_find:
             mock_find.return_value = '/usr/bin/soffice'
 
-            with patch('awslabs.document_loader_mcp_server.server.subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0)
+            with patch('awslabs.document_loader_mcp_server.server.subprocess.Popen') as mock_popen:
+                mock_popen.return_value = MagicMock(returncode=0)
+                mock_popen.return_value.communicate.return_value = (b'', b'')
                 # Don't create the PDF file — simulates soffice failing silently
                 with pytest.raises(FileNotFoundError, match='PDF file not found'):
                     _convert_to_pdf_with_soffice('/input/test.pptx', temp_dir)
@@ -1066,7 +1185,7 @@ def test_extract_slides_sync_pdf():
             assert 'slide_2.png' in result[1]
             mock_page1.save.assert_called_once()
             mock_page2.save.assert_called_once()
-            mock_convert.assert_called_once_with('/test/doc.pdf', dpi=200)
+            mock_convert.assert_called_once_with('/test/doc.pdf', dpi=200, timeout=30)
             print('✓ _extract_slides_sync works for PDF')
 
 
@@ -1090,7 +1209,7 @@ def test_extract_slides_sync_pptx():
                 assert len(result) == 1
                 assert 'slide_1.png' in result[0]
                 mock_soffice.assert_called_once()
-                mock_convert.assert_called_once_with('/tmp/converted.pdf', dpi=200)
+                mock_convert.assert_called_once_with('/tmp/converted.pdf', dpi=200, timeout=30)
                 print('✓ _extract_slides_sync works for PPTX')
 
 
@@ -1162,6 +1281,55 @@ async def test_extract_slides_general_exception():
                     assert result.status == 'error'
                     assert 'Conversion failed' in result.error_message
                     print('✓ extract_slides_as_images general exception covered')
+
+
+def test_output_dir_containment_enforced_under_ci_env(tmp_path):
+    """Regression: the write path (output_dir) stays sandboxed under ambient CI env.
+
+    Companion to ``test_sandbox_enforced_under_ci_env_end_to_end`` (read path).
+    ``extract_slides_as_images`` validates ``output_dir`` via
+    ``validate_output_dir`` -> ``_is_within_base_directory`` -> ``_get_base_directory``,
+    the same helper the ``CI`` / ``GITHUB_ACTIONS`` / ``PYTEST_CURRENT_TEST`` bypass
+    affected. Pre-fix, the bypass widened the base to ``/`` so any ``output_dir``
+    was accepted (arbitrary-directory write). This asserts write-path containment
+    holds regardless of ambient CI signals.
+    """
+    from pathlib import Path
+
+    base_dir = tmp_path / 'sandbox'
+    base_dir.mkdir()
+
+    env = {
+        'DOCUMENT_BASE_DIR': str(base_dir),
+        'CI': 'true',
+        'GITHUB_ACTIONS': 'true',
+        'PYTEST_CURRENT_TEST': 'x',
+    }
+    with patch.dict(os.environ, env, clear=True):
+        # An output_dir OUTSIDE the sandbox is denied even with CI env present.
+        outside = tmp_path / 'evil_output'
+        error = validate_output_dir(str(outside))
+        assert error is not None
+        assert 'Access denied' in error
+
+        # An output_dir INSIDE the sandbox is allowed.
+        inside = base_dir / 'slides_out'
+        assert validate_output_dir(str(inside)) is None
+
+    # With no base configured, the default is the resolved cwd even under CI.
+    # Use a controlled cwd (not '/') so the check is platform-neutral and not
+    # dependent on where the suite runs.
+    with patch.dict(os.environ, {'CI': 'true'}, clear=True):
+        original_cwd = Path.cwd()
+        cwd_dir = tmp_path / 'cwd'
+        cwd_dir.mkdir()
+        os.chdir(cwd_dir)
+        try:
+            outside = tmp_path / 'evil_output'  # sibling of cwd, outside it
+            assert validate_output_dir(str(outside)) is not None
+        finally:
+            os.chdir(original_cwd)
+    print('✓ output_dir containment enforced under ambient CI env')
 
 
 if __name__ == '__main__':

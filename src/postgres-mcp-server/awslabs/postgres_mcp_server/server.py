@@ -22,11 +22,16 @@ import threading
 from awslabs.postgres_mcp_server.connection.abstract_db_connection import AbstractDBConnection
 from awslabs.postgres_mcp_server.connection.cp_api_connection import (
     DEFAULT_POSTGRES_PORT,
+    PROXY_LISTEN_PORT,
+    find_proxy_for_cluster,
+    find_proxy_for_instance,
     internal_create_express_cluster,
     internal_create_serverless_cluster,
     internal_get_cluster_properties,
     internal_get_cluster_valid_endpoints,
     internal_get_instance_properties,
+    proxy_supports_connection,
+    select_proxy_endpoint,
     setup_aurora_iam_policy_for_current_user,
 )
 from awslabs.postgres_mcp_server.connection.db_connection_map import (
@@ -35,22 +40,28 @@ from awslabs.postgres_mcp_server.connection.db_connection_map import (
     DBConnectionMap,
 )
 from awslabs.postgres_mcp_server.connection.psycopg_pool_connection import (
+    ALLOWED_SSLMODES,
+    DEFAULT_SSLMODE,
     PsycopgPoolConnection,
     get_credentials_from_secret,
 )
 from awslabs.postgres_mcp_server.connection.rds_api_connection import RDSDataAPIConnection
-from awslabs.postgres_mcp_server.mutable_sql_detector import (
-    check_sql_injection_risk,
-    detect_mutating_keywords,
-)
+from awslabs.postgres_mcp_server.sql_guard import SqlPolicyError, assert_executable
 from botocore.exceptions import ClientError
+from contextlib import asynccontextmanager
 from datetime import datetime
 from loguru import logger
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.shared.exceptions import McpError
-from mcp.types import INVALID_PARAMS, ErrorData
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS
 from pydantic import Field
-from typing import Annotated, Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, AsyncIterator, Dict, List, Optional, Tuple
+
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
+else:
+    from builtins import BaseExceptionGroup
 
 
 # Max identifier length in bytes (NAMEDATALEN - 1, default compile-time constant)
@@ -63,10 +74,47 @@ db_connection_map = DBConnectionMap()
 async_job_status: Dict[str, dict] = {}
 async_job_status_lock = threading.Lock()
 client_error_code_key = 'run_query ClientError code'
-write_query_prohibited_key = 'Your MCP tool only allows readonly query. If you want to write, change the MCP configuration per README.md'
-query_comment_prohibited_key = 'The comment in query is prohibited because of injection risk'
-query_injection_risk_key = 'Your query contains risky injection patterns'
 readonly_query = True
+# Optional operator-supplied CA bundle for certificate verification on psycopg
+# (PG Wire) connections, overriding the bundled Amazon RDS bundle. Set from
+# --ca_bundle (a PEM path, or the sentinel 'system' for the OS trust store).
+# None means use the bundled bundle (or system trust store as a last resort).
+configured_ca_bundle: Optional[str] = None
+# libpq SSL mode for psycopg (PG Wire) connections. Set from --sslmode; always
+# one of ALLOWED_SSLMODES (the connection is always encrypted). Default is
+# verify-full (AWS's production guidance): encrypted + CA chain + hostname
+# verified against the bundled combined AWS CA (RDS private CAs + public Amazon
+# roots), which connects to direct instances, cluster endpoints, and RDS Proxy
+# out of the box. verify-ca / require are opt-downs for IP/tunnel/self-signed.
+configured_sslmode: str = DEFAULT_SSLMODE
+
+# Least-privilege guardrail policy for post-connect validation.
+#   'warn' (default): log a warning but allow a connection whose Postgres role
+#       is a superuser or a member of rds_superuser. Chosen as the default so
+#       upgrades and the create_cluster bootstrap (which connects as the
+#       rds_superuser master before any least-privilege role exists) don't
+#       break; operators are encouraged to set 'enforce' in production.
+#   'enforce': reject such an over-privileged connection (fail-closed).
+#   'off': skip the privilege check entirely (connectivity only).
+# Set from the --privilege_check CLI arg in main().
+PRIVILEGE_CHECK_ENFORCE = 'enforce'
+PRIVILEGE_CHECK_WARN = 'warn'
+PRIVILEGE_CHECK_OFF = 'off'
+privilege_check_policy = PRIVILEGE_CHECK_WARN
+
+# RDS Proxy auto-detection policy, set from --rds_proxy.
+#   'off' (default): never look for a proxy. Behavior is identical to not having
+#       this feature, which is why it is the default -- routing an existing
+#       deployment through a proxy it was not configured for can turn a working
+#       connection into an auth or reachability failure.
+#   'auto': look for a proxy fronting the target and, when one is found that
+#       will accept this connection method and secret, connect through it.
+# Applies to standalone RDS instances (RPG) and to Aurora clusters (APG). For a
+# cluster, only the writer and reader endpoints have proxy equivalents; a custom
+# or member-instance endpoint always connects directly.
+RDS_PROXY_OFF = 'off'
+RDS_PROXY_AUTO = 'auto'
+configured_rds_proxy_mode: str = RDS_PROXY_OFF
 
 # Per-target Secrets Manager ARN overrides configured at server startup via
 # repeatable --secret_arn flags. Lookups are by:
@@ -83,16 +131,42 @@ readonly_query = True
 # matches; cluster/instance MasterUserSecret is used as a final fallback.
 configured_secret_arns: Dict[str, str] = {}
 configured_default_secret_arn: Optional[str] = None
+# A configured PG-wire connection is constructed and cached synchronously in
+# main(), but its pool must not be initialized until MCP starts serving on its
+# own event loop. The lifespan validates it on that loop before tool calls are
+# accepted.
+startup_pg_wire_connection: Optional[AbstractDBConnection] = None
 
 
-class DummyCtx:
+def _startup_validation_uses_serving_loop(db_connection: AbstractDBConnection) -> bool:
+    """Return whether startup validation must run on MCP's serving loop.
+
+    Loop-affine connectors set ``requires_serving_loop`` on the class. The
+    class is checked, rather than the instance, so a test double that
+    auto-creates attributes stays on the synchronous startup path.
+    """
+    return getattr(type(db_connection), 'requires_serving_loop', False) is True
+
+
+def _configure_windows_event_loop_policy() -> None:
+    """Use a selector loop on Windows for psycopg's async connections."""
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+class DummyCtx(Context):
     """A dummy context class for error handling in MCP tools."""
 
-    async def error(self, message):
+    def __init__(self) -> None:
+        """Initialize with no request context; nothing here needs one."""
+        super().__init__()
+
+    async def error(self, data: Any, *, logger_name: Optional[str] = None):
         """Raise a runtime error with the given message.
 
         Args:
-            message: The error message to include in the runtime error
+            data: The error message to include in the runtime error
+            logger_name: Accepted for signature compatibility with Context.error; unused
         """
         # Do nothing
         pass
@@ -127,11 +201,252 @@ def parse_execute_response(response: dict) -> list[dict]:
     return records
 
 
-mcp = FastMCP(
+class ConnectionValidationError(Exception):
+    """Raised when a freshly established connection fails post-connect validation.
+
+    Currently signals a least-privilege violation (the connected Postgres role
+    is a superuser, a member of rds_superuser, or carries the BYPASSRLS
+    attribute) under the 'enforce' policy, or an inability to verify the
+    role's privileges (fail-closed).
+    """
+
+
+class _StartupRefusedError(ConnectionValidationError):
+    """Mark a deliberate validation refusal before MCP begins serving."""
+
+
+def _is_startup_refusal(error: BaseException) -> bool:
+    """Recognize only startup refusals, including nested AnyIO exception groups."""
+    if isinstance(error, _StartupRefusedError):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return all(_is_startup_refusal(child) for child in error.exceptions)
+    return False
+
+
+# Determine whether the connected role is over-privileged: a superuser, a
+# member of the managed rds_superuser role, or a role carrying the BYPASSRLS
+# attribute (which defeats row-level security without being a superuser).
+# current_user can always read its own row in the pg_roles view, and the
+# EXISTS clause evaluates to false (rather than erroring) on clusters where
+# rds_superuser does not exist (e.g. self-hosted PostgreSQL), so the query is
+# safe across managed and unmanaged deployments.
+POSTGRES_PRIVILEGE_QUERY = (
+    'SELECT rolsuper AS is_superuser, '
+    'rolbypassrls AS is_bypassrls, '
+    'EXISTS ('
+    "SELECT 1 FROM pg_roles r WHERE r.rolname = 'rds_superuser' "
+    "AND pg_has_role(current_user, r.oid, 'MEMBER')"
+    ') AS is_rds_superuser '
+    'FROM pg_roles WHERE rolname = current_user'
+)
+
+
+async def validate_connection(db_connection: AbstractDBConnection, policy: str) -> None:
+    """Post-connect validation: connectivity plus a least-privilege guardrail.
+
+    Runs once when a connection is established (at startup and via the
+    connect_to_database tool). The privilege query doubles as a connectivity
+    check. Behaviour by policy:
+
+      - 'off':     connectivity only (a shared SELECT 1 health probe); no
+                   privilege check.
+      - 'warn':    run the privilege check. If the role is over-privileged or
+                   its privileges can't be determined, log a warning but still
+                   ALLOW the connection. However, if the check query cannot run
+                   at all (database unreachable or authentication failed), that
+                   error is raised, not suppressed: 'warn' only softens the
+                   privilege check, it does not waive the need for a working
+                   connection.
+      - 'enforce': run the privilege check; raise ConnectionValidationError
+                   on a violation, or if the check could not be performed
+                   (fail-closed).
+
+    Any unrecognized policy value is treated as 'enforce' (fail-closed) so a
+    typo or a direct global assignment that bypasses argparse can never
+    silently allow an over-privileged connection.
+
+    The primary security boundary is a least-privilege database role; this
+    guardrail simply refuses to operate as an over-privileged role (superuser,
+    rds_superuser member, or BYPASSRLS) so the MCP is not silently running
+    with privileges that would render row-level security and the blocklist
+    moot.
+
+    Args:
+        db_connection: the freshly established data-plane connection.
+        policy: one of 'enforce', 'warn', 'off'.
+
+    Raises:
+        ConnectionValidationError: under 'enforce', on a privilege violation
+            or when privileges cannot be verified.
+    """
+    if policy == PRIVILEGE_CHECK_OFF:
+        # Connectivity only — reuse the connection's own SELECT 1 health probe
+        # instead of hand-rolling one. check_connection_health() returns False
+        # (and logs the underlying error) on failure, so translate that into a
+        # raised error to preserve fail-fast behavior at startup / connect.
+        if not await db_connection.check_connection_health():
+            raise ConnectionValidationError('Connectivity check failed: SELECT 1 did not succeed.')
+        return
+
+    try:
+        response = await db_connection.execute_query(POSTGRES_PRIVILEGE_QUERY)
+        rows = parse_execute_response(response)
+    except Exception as e:
+        # A thrown error here means the probe query did not execute at all —
+        # a genuine connectivity/auth failure, not merely an "unverifiable
+        # privilege". Connectivity is required under every policy: 'warn'
+        # relaxes the privilege guardrail, not the requirement that the
+        # connection works. Fail closed under enforce; propagate the
+        # underlying error under warn (previously this was swallowed, which
+        # let an unreachable/mis-authenticated connection start up as if
+        # healthy).
+        message = f'Could not verify connection role privileges: {type(e).__name__}: {e}'
+        # Fail-closed for enforce AND any unrecognized policy; only an explicit
+        # 'warn' propagates the raw error without wrapping.
+        if policy != PRIVILEGE_CHECK_WARN:
+            raise ConnectionValidationError(f'{message}. Rejecting connection (fail-closed).')
+        logger.warning(f'{message}. Connectivity check failed; rejecting connection.')
+        raise
+
+    # Treat both an empty result set and a result missing the expected
+    # columns as "unverifiable" — we control the query, so this should not
+    # happen, but a guardrail must not silently pass a role it could not
+    # actually inspect.
+    if (
+        not rows
+        or 'is_superuser' not in rows[0]
+        or 'is_rds_superuser' not in rows[0]
+        or 'is_bypassrls' not in rows[0]
+    ):
+        message = 'Could not determine connection role privileges (unexpected result shape).'
+        # Fail-closed for enforce AND any unrecognized policy; only 'warn' allows.
+        if policy != PRIVILEGE_CHECK_WARN:
+            raise ConnectionValidationError(f'{message} Rejecting connection (fail-closed).')
+        logger.warning(f'{message} Allowing connection (privilege_check=warn).')
+        return
+
+    is_superuser = bool(rows[0].get('is_superuser'))
+    is_rds_superuser = bool(rows[0].get('is_rds_superuser'))
+    is_bypassrls = bool(rows[0].get('is_bypassrls'))
+    over_privileged = is_superuser or is_rds_superuser or is_bypassrls
+
+    # Record the probe result on the connection for diagnostics (observability
+    # only; the enforcement decision below is independent of this attribute).
+    db_connection.effective_is_over_privileged = over_privileged
+
+    if over_privileged:
+        flags = []
+        if is_superuser:
+            flags.append('a superuser')
+        if is_rds_superuser:
+            flags.append('a member of rds_superuser')
+        if is_bypassrls:
+            flags.append('a BYPASSRLS role')
+        message = (
+            f'The MCP server is connecting as an over-privileged Postgres role '
+            f'({" and ".join(flags)}). Such privileges bypass row-level security; '
+            f'a superuser or rds_superuser member can additionally read credential '
+            f'catalogs and terminate other sessions. Connect using a dedicated '
+            f'least-privilege role instead (see the Security Consideration section '
+            f'of README.md). To run with this role anyway, set '
+            f'--privilege_check=warn or off (not recommended).'
+        )
+        # Fail-closed for enforce AND any unrecognized policy; only 'warn' allows.
+        if policy != PRIVILEGE_CHECK_WARN:
+            raise ConnectionValidationError(message)
+        logger.warning(f'{message} Allowing connection (privilege_check=warn).')
+        return
+
+    logger.debug(
+        'Connection role privilege check passed (not superuser / rds_superuser / BYPASSRLS).'
+    )
+
+
+def attach_privilege_advisory(llm_response: str, db_connection: AbstractDBConnection) -> str:
+    """Attach an over-privileged advisory to a successful connect response.
+
+    Under 'warn' an over-privileged connection (superuser, rds_superuser
+    member, or BYPASSRLS) is allowed and validate_connection logs a warning.
+    That server-side log is frequently invisible to the MCP host (the server's
+    stderr is often not captured), so also surface the posture in the tool
+    response itself as a structured, parseable advisory the caller can see.
+
+    Additive and non-destructive: existing response fields are preserved; an
+    'advisories' list is added (or appended to). No-op when the role is not
+    over-privileged or the posture was not determined (``effective_is_over_privileged``
+    is False/None), and under 'enforce' this path is never reached for an
+    over-privileged role (it is rejected and reported as a 'Failed' response).
+
+    Args:
+        llm_response: the JSON string returned by internal_create_connection.
+        db_connection: the connection whose privilege posture was just probed.
+
+    Returns:
+        The response JSON string, with an advisory appended when applicable.
+    """
+    if db_connection.effective_is_over_privileged is not True:
+        return llm_response
+    advisory = {
+        'code': 'over_privileged_role',
+        'severity': 'warning',
+        'message': (
+            'Connected as an over-privileged Postgres role (superuser, a member '
+            'of rds_superuser, or a BYPASSRLS role). Such a role bypasses '
+            'row-level security and can read credential catalogs; prefer a '
+            'dedicated least-privilege role (see the Security Consideration '
+            'section of README.md). Allowed because privilege_check=warn.'
+        ),
+    }
+    try:
+        payload = json.loads(llm_response)
+    except (TypeError, ValueError):
+        # Response was not JSON (unexpected for the normal path); leave it
+        # untouched rather than dropping the original content.
+        return llm_response
+    if not isinstance(payload, dict):
+        return llm_response
+    payload.setdefault('advisories', []).append(advisory)
+    return json.dumps(payload, indent=2, default=str)
+
+
+@asynccontextmanager
+async def server_lifespan(server: MCPServer) -> AsyncIterator[Dict[str, Any]]:
+    """Validate startup PG-wire state and close cached connections on MCP's loop."""
+    global startup_pg_wire_connection
+
+    try:
+        if startup_pg_wire_connection is not None:
+            # A PsycopgPoolConnection lazily initializes its AsyncConnectionPool
+            # and aiorwlock on first use. Doing this here keeps the startup
+            # validation and every subsequent tool call on MCP's serving loop,
+            # instead of binding them to the temporary loop from asyncio.run().
+            try:
+                await validate_connection(startup_pg_wire_connection, privilege_check_policy)
+                logger.success('Successfully validated database connection to Postgres')
+            except ConnectionValidationError as e:
+                logger.error(f'Refusing to start: {e}')
+                raise _StartupRefusedError(str(e)) from e
+            except Exception as e:
+                logger.error(
+                    f'Failed to validate database connection to Postgres: {e}. Exit the MCP server'
+                )
+                raise
+
+        yield {}
+    finally:
+        # Pools and their locks are loop-bound after validation/tool use, so
+        # close them before MCP tears down this same serving loop.
+        await db_connection_map.close_all_async()
+        startup_pg_wire_connection = None
+
+
+mcp = MCPServer(
     'pg-mcp MCP server. This is the starting point for all solutions created',
     dependencies=[
         'loguru',
     ],
+    lifespan=server_lifespan,
 )
 
 
@@ -162,15 +477,17 @@ async def run_query(
         List of dictionary that contains query response rows
     """
     global client_error_code_key
-    global write_query_prohibited_key
     global db_connection_map
 
+    # Metadata at INFO; the full SQL text may contain credential/token/PII
+    # literals, so it is emitted only at DEBUG (opt-in), never at INFO. This
+    # keeps the no-echo property the SQL guard maintains true end to end.
     logger.info(
         f'Entered run_query with '
         f'method:{connection_method}, cluster_identifier:{cluster_identifier}, '
-        f'db_endpoint:{db_endpoint}, database:{database}, '
-        f'sql:{sql}'
+        f'db_endpoint:{db_endpoint}, database:{database}'
     )
+    logger.debug(f'run_query SQL: {sql}')
 
     db_connection = db_connection_map.get(
         method=connection_method,
@@ -187,32 +504,25 @@ async def run_query(
         await ctx.error(err)
         return [{'error': err}]
 
-    if db_connection.readonly_query:
-        matches = detect_mutating_keywords(sql)
-        if (bool)(matches):
-            logger.info(
-                (
-                    f'query is rejected because current setting only allows readonly query.'
-                    f'detected keywords: {matches}, SQL query: {sql}'
-                )
-            )
-            await ctx.error(write_query_prohibited_key)
-            return [{'error': write_query_prohibited_key}]
-
-    issues = check_sql_injection_risk(sql)
-    if issues:
-        logger.info(
-            f'query is rejected because it contains risky SQL pattern, SQL query: {sql}, reasons: {issues}'
-        )
-        await ctx.error(
-            str({'message': 'Query parameter contains suspicious pattern', 'details': issues})
-        )
-        return [{'error': query_injection_risk_key}]
+    # Parser-based policy guard (pglast). Rejects dangerous constructs in both
+    # modes and, in read-only mode, any non-read (write-set) statement. Fails
+    # closed on parse errors, oversized input, and multi-statement submissions.
+    try:
+        assert_executable(sql, allow_write_query=not db_connection.readonly_query)
+    except SqlPolicyError as e:
+        # Only the sanitized reason at INFO. The guard keeps string literals out
+        # of its message (see sql_guard and
+        # test_rejection_message_does_not_echo_sensitive_literal); the full
+        # statement was already logged at DEBUG on entry, so it is not repeated
+        # here and never reaches INFO.
+        logger.info(f'query rejected by SQL policy guard: {e}')
+        await ctx.error(str(e))
+        return [{'error': str(e)}]
 
     try:
         logger.debug(
             (
-                f'run_query: sql:{sql} method:{connection_method}, '
+                f'run_query: method:{connection_method}, '
                 f'cluster_identifier:{cluster_identifier} database:{database} '
                 f'db_endpoint:{db_endpoint} '
                 f'readonly:{db_connection.readonly_query} query_parameters:{query_parameters}'
@@ -221,7 +531,7 @@ async def run_query(
 
         response = await db_connection.execute_query(sql, query_parameters)
 
-        logger.success(f'run_query successfully executed query:{sql}')
+        logger.success('run_query executed query successfully')
         return parse_execute_response(response)
     except ClientError as e:
         logger.exception(f'run_query ClientError: {e.response["Error"]["Code"]}')
@@ -266,9 +576,7 @@ async def get_table_schema(
     )
 
     if not validate_table_name(table_name):
-        raise McpError(
-            ErrorData(code=INVALID_PARAMS, message=(f"Invalid table name: '{table_name}'. "))
-        )
+        raise MCPError(code=INVALID_PARAMS, message=(f"Invalid table name: '{table_name}'. "))
 
     sql = """
         SELECT
@@ -309,6 +617,16 @@ async def connect_to_database(
     db_endpoint: Annotated[str, Field(description='database endpoint')],
     port: Annotated[int, Field(description='Postgres port')],
     database: Annotated[str, Field(description='database name')],
+    rds_proxy: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional RDS Proxy mode for this connection: 'auto' to connect through "
+                "an RDS Proxy fronting the target when a usable one exists, 'off' to "
+                'connect directly. Omit to use the server default set by --rds_proxy.'
+            )
+        ),
+    ] = None,
 ) -> str:
     """Connect to a specific database save the connection internally.
 
@@ -320,6 +638,12 @@ async def connect_to_database(
         db_endpoint: database endpoint
         port: database port
         database: database name. Required parameter
+        rds_proxy: Optional. 'auto' to connect through an RDS Proxy fronting the
+            target when a usable one exists, 'off' to connect directly. Omit to
+            use the server default. Applies to standalone RDS instances and to
+            Aurora clusters addressed by their writer or reader endpoint; a
+            custom or member-instance endpoint always connects directly, since a
+            proxy chooses its own backend.
 
         Supported scenario:
         1. Aurora Postgres database with RDS_API + Credential Manager:
@@ -336,6 +660,34 @@ async def connect_to_database(
             db_endpoint must be set
     """
     try:
+        # Decide whether internal_create_connection returned an existing
+        # (already-validated) connection or created a fresh one, so we can skip
+        # re-running pool init / the privilege probe on a cache hit. Re-probing
+        # is redundant (an extra round-trip / billable Data API call) and, worse,
+        # a transient probe failure (throttling, Serverless resume, pool timeout)
+        # would evict a healthy, in-use shared connection.
+        #
+        # Detect the cache hit by OBJECT IDENTITY against a pre-call snapshot,
+        # not by rebuilding the map key. internal_create_connection stores under
+        # the AWS-resolved endpoint/port, which can differ from the caller args
+        # (e.g. an empty db_endpoint the resolver fills in, or a non-5432 port),
+        # so a key-based lookup here can wrongly report "not cached". If the
+        # returned connection already existed it is in this snapshot; if it was
+        # just created it is not. internal_create_connection is synchronous, so
+        # nothing interleaves between the snapshot and the identity check.
+        #
+        # Caveat: connections established through connect_to_database (and the
+        # startup path) are validated at creation, so skipping re-validation for
+        # a cached one is safe. Connections seeded by create_cluster /
+        # create_cluster_worker are cached WITHOUT validation (an intentional
+        # bootstrap: the freshly created cluster only has the rds_superuser
+        # master and no least-privilege role yet). For those this skip means an
+        # over-privileged connection is not surfaced/evicted on reconnect — under
+        # the default 'warn' this is moot, and under 'enforce' it is the known
+        # create_cluster bootstrap gap tracked as a follow-up (validate-on-create
+        # with a bootstrap exemption).
+        existing_connections = db_connection_map.list_connections()
+
         db_connection, llm_response = internal_create_connection(
             region=region,
             database_type=database_type,
@@ -344,22 +696,44 @@ async def connect_to_database(
             db_endpoint=db_endpoint,
             port=port,
             database=database,
+            rds_proxy=rds_proxy,
         )
 
-        # Eagerly initialize the connection pool so it's ready for queries
-        # and created_time is set at connect time, not at first query time
-        if isinstance(db_connection, PsycopgPoolConnection):
-            try:
-                await db_connection.initialize_pool()
-            except Exception:
-                # Pool failed to open — remove the broken connection from the map
-                # so the next connect attempt creates a fresh one
-                db_connection_map.remove(
-                    connection_method, cluster_identifier, db_endpoint, database, port
-                )
-                raise
+        was_cached = any(existing is db_connection for existing in existing_connections)
 
-        return str(llm_response)
+        if was_cached:
+            # A previously-validated over-privileged connection keeps its
+            # diagnostic flag, so re-surface the advisory on reconnect too.
+            return attach_privilege_advisory(str(llm_response), db_connection)
+
+        # Newly-created connection: eagerly initialize the pool (so it's ready
+        # for queries and created_time is set at connect time) and run the
+        # least-privilege guardrail. On ANY failure, evict AND close the fresh
+        # connection:
+        #   - evict so a rejected/broken connection can't be reached later via
+        #     run_query (fail-closed: a fresh connection we could not validate
+        #     must not remain cached);
+        #   - close so we don't orphan an already-opened AsyncConnectionPool
+        #     with live backend sessions.
+        # Evict by object identity because the map key uses the AWS-resolved
+        # endpoint/port, which may differ from the caller-supplied args here
+        # (empty db_endpoint, non-5432 port, host casing); a key-based remove()
+        # rebuilt from caller args could miss and leave the connection cached.
+        try:
+            if isinstance(db_connection, PsycopgPoolConnection):
+                await db_connection.initialize_pool()
+            await validate_connection(db_connection, privilege_check_policy)
+        except Exception:
+            db_connection_map.remove_connection(db_connection)
+            try:
+                await db_connection.close()
+            except Exception as close_err:
+                logger.warning(
+                    f'Error closing rejected/failed connection during cleanup: {close_err}'
+                )
+            raise
+
+        return attach_privilege_advisory(str(llm_response), db_connection)
 
     except Exception as e:
         logger.exception(f'connect_to_database failed with error: {str(e)}')
@@ -423,6 +797,18 @@ def create_cluster(
     with_express_configuration: Annotated[
         bool, Field(description='with express configuration')
     ] = False,
+    enable_iam_auth: Annotated[
+        bool,
+        Field(
+            description=(
+                'Enable IAM database authentication on the created cluster. Only '
+                'permits IAM token auth in addition to password auth (does not '
+                'disable passwords). Capability toggle only: a DB role still needs '
+                'GRANT rds_iam and an rds-db:connect IAM policy to connect via IAM. '
+                'Ignored for express clusters (they enable IAM auth automatically).'
+            )
+        ),
+    ] = False,
 ) -> str:
     """Create an RDS/Aurora cluster.
 
@@ -432,6 +818,10 @@ def create_cluster(
         database: database name, ignored when with_express_configuration is set to true
         engine_version: engine version, ignored when with_express_configuration is set to true
         with_express_configuration: create the cluster with express configuration
+        enable_iam_auth: enable IAM database authentication on the cluster (serverless
+            path only; express enables IAM auth via its express configuration). Only
+            permits IAM auth in addition to passwords; still requires GRANT rds_iam and
+            an rds-db:connect IAM policy to be usable.
 
     Returns:
         result
@@ -451,6 +841,17 @@ def create_cluster(
         connection_method = ConnectionMethod.RDS_API
 
     if with_express_configuration:
+        # Express is inherently IAM-based (it hardcodes PG_WIRE_IAM_PROTOCOL and
+        # enables IAM auth via its express configuration), so enable_iam_auth is
+        # not honored here. Surface the contradiction rather than silently doing
+        # the opposite of what enable_iam_auth=False requested.
+        if not enable_iam_auth:
+            logger.warning(
+                'create_cluster: enable_iam_auth=False is ignored with '
+                'with_express_configuration=True; express clusters are always '
+                'IAM-enabled (PG_WIRE_IAM_PROTOCOL). Proceeding with IAM auth enabled.'
+            )
+
         internal_create_express_cluster(cluster_identifier, region)
 
         properties = internal_get_cluster_properties(
@@ -502,6 +903,7 @@ def create_cluster(
             cluster_identifier,
             engine_version,
             database,
+            enable_iam_auth,
         ),
         daemon=False,
     )
@@ -552,6 +954,7 @@ def create_cluster_worker(
     cluster_identifier: str,
     engine_version: str,
     database: str,
+    enable_iam_auth: bool = False,
 ):
     """Background worker for cluster creation.
 
@@ -563,6 +966,7 @@ def create_cluster_worker(
         cluster_identifier: Cluster identifier
         engine_version: Engine version
         database: Database name
+        enable_iam_auth: Enable IAM database authentication on the created cluster.
     """
     global db_connection_map
     global async_job_status
@@ -575,6 +979,7 @@ def create_cluster_worker(
             cluster_identifier=cluster_identifier,
             engine_version=engine_version,
             database_name=database,
+            enable_iam_auth=enable_iam_auth,
         )
 
         setup_aurora_iam_policy_for_current_user(
@@ -621,6 +1026,9 @@ def internal_create_connection(
     db_endpoint: Annotated[str, Field(description='database endpoint')],
     port: Annotated[int, Field(description='Postgres port')],
     database: Annotated[str, Field(description='database name')] = 'postgres',
+    rds_proxy: Annotated[
+        Optional[str], Field(description="RDS Proxy mode override: 'off' or 'auto'")
+    ] = None,
 ) -> Tuple:
     """Connect to a specific database save the connection internally.
 
@@ -652,6 +1060,8 @@ def internal_create_connection(
         db_endpoint: database endpoint
         port: database port
         database: database name
+        rds_proxy: Per-call RDS Proxy mode ('off' or 'auto'), overriding the
+            startup --rds_proxy setting. None means use the startup setting.
     """
     global db_connection_map
     global readonly_query
@@ -685,17 +1095,20 @@ def internal_create_connection(
         connection_method, cluster_identifier, db_endpoint, database, port
     )
     if existing_conn:
-        llm_response = json.dumps(
-            {
-                'connection_method': connection_method,
-                'cluster_identifier': cluster_identifier,
-                'db_endpoint': db_endpoint,
-                'database': database,
-                'port': port,
-            },
-            indent=2,
-            default=str,
-        )
+        cached_response: Dict[str, Any] = {
+            'connection_method': connection_method,
+            'cluster_identifier': cluster_identifier,
+            'db_endpoint': db_endpoint,
+            'database': database,
+            'port': port,
+        }
+        # This path returns before the proxy lookup, so read proxied-ness off the
+        # cached connection rather than re-deriving it. Omitted when absent, so the
+        # key means the same thing here as on the create path.
+        cached_proxy = getattr(existing_conn, 'proxy_endpoint', None)
+        if isinstance(cached_proxy, str) and cached_proxy:
+            cached_response['proxy_endpoint'] = cached_proxy
+        llm_response = json.dumps(cached_response, indent=2, default=str)
         return (existing_conn, llm_response)
 
     # Resolve the Secrets Manager ARN and master-username candidate from
@@ -707,6 +1120,18 @@ def internal_create_connection(
     # always populate MasterUsername.
     metadata_secret_arn: str = ''
     metadata_master_username: str = ''
+    # The RDS Proxy endpoint fronting this target, when there is one.
+    # Deliberately kept separate from db_endpoint, which stays the
+    # AWS-resolved instance or cluster endpoint for the whole function, because
+    # db_endpoint serves as the target's identity: it keys the per-target
+    # Secrets Manager override map, keys the connection map, and is echoed back to the caller.
+    proxy_endpoint: Optional[str] = None
+    # Set only on the standalone-RPG path; empty for cluster targets.
+    db_instance_id: str = ''
+    # Set only on the cluster path. eligible is False when the caller asked for a
+    # custom or member-instance endpoint, which a proxy cannot reproduce.
+    cluster_proxy_eligible: bool = False
+    cluster_wants_read_only: bool = False
 
     enable_data_api: bool = False
     cluster_arn: str = ''
@@ -723,6 +1148,7 @@ def internal_create_connection(
         metadata_master_username = cluster_properties.get('MasterUsername', '') or ''
 
         cluster_writer_endpoint = cluster_properties.get('Endpoint', '')
+        cluster_reader_endpoint = cluster_properties.get('ReaderEndpoint', '') or ''
         try:
             cluster_port = int(cluster_properties.get('Port') or 0)
         except (TypeError, ValueError):
@@ -764,6 +1190,19 @@ def internal_create_connection(
                 raise ValueError(err)
 
             db_endpoint, port = matched
+
+        # Which role did the caller ask for? Classified after both branches so it
+        # covers the default case too (no endpoint supplied resolves to the
+        # writer). Derived from the AWS-resolved host, never the caller's raw
+        # string. Only the writer and reader cluster endpoints have proxy
+        # equivalents: a custom endpoint or a specific member instance endpoint
+        # names a backend the proxy cannot be asked for, since the proxy chooses
+        # -- those stay direct.
+        if db_endpoint == cluster_writer_endpoint:
+            cluster_proxy_eligible = True
+        elif cluster_reader_endpoint and db_endpoint == cluster_reader_endpoint:
+            cluster_proxy_eligible = True
+            cluster_wants_read_only = True
     else:
         # Must be RPG instance only deployment case (i.e. without cluster).
         # internal_get_instance_properties already verifies that the supplied
@@ -784,6 +1223,11 @@ def internal_create_connection(
         if resolved_port:
             port = resolved_port
 
+        # The proxy lookup itself happens after the secret is resolved, because
+        # deciding whether a proxy will accept this connection requires knowing
+        # which secret we will authenticate with.
+        db_instance_id = instance_properties.get('DBInstanceIdentifier', '')
+
     # Resolve the Secrets Manager ARN. Per-target override map wins,
     # then the bare default ARN, then the cluster/instance MasterUserSecret.
     # IAM-only clusters (Aurora express) advertise no MasterUserSecret,
@@ -795,7 +1239,9 @@ def internal_create_connection(
     if cluster_identifier:
         target_key = cluster_identifier
     else:
-        target_key = db_endpoint  # already overwritten with the AWS-resolved host above
+        # The AWS-resolved instance host. Never the RDS Proxy endpoint.
+        target_key = db_endpoint
+
     per_target_secret_arn = configured_secret_arns.get(target_key, '')
     effective_secret_arn = (
         per_target_secret_arn or configured_default_secret_arn or metadata_secret_arn or ''
@@ -815,6 +1261,117 @@ def internal_create_connection(
                 f'by Secrets Manager (ManageMasterUserPassword=True).'
             )
 
+    # RDS Proxy detection, opt-in via --rds_proxy. Default 'off' keeps upgrades a
+    # no-op: routing a connection through a proxy can turn a working direct
+    # connection into an auth or network failure (unregistered secret, IAMAuth
+    # mismatch, an rds-db:connect policy scoped to the instance, or a security
+    # group that reaches the instance but not the proxy), so the operator has to
+    # ask for it.
+    # Per-call override wins over the startup default. The startup flag sets the
+    # default rather than a ceiling: a caller going through connect_to_database
+    # already chooses the connection method, endpoint and database, and the proxy
+    # itself is discovered from the RDS APIs rather than supplied, so this cannot
+    # redirect the connection to a host the caller names.
+    # Validated, not just compared. --rds_proxy is guarded by argparse choices=;
+    # this parameter has no such guard, so an unrecognized value would fail the
+    # == RDS_PROXY_AUTO test below and silently connect directly -- indistinguishable
+    # from "this target has no proxy". That is the wrong failure mode here in
+    # particular: the parameter exists so a caller that is not the config file can
+    # ask for proxy routing, and a model filling in an enum will produce 'AUTO' or
+    # 'true' some of the time. Normalize case, then reject what cannot be honored.
+    if rds_proxy is not None:
+        effective_rds_proxy_mode = rds_proxy.strip().lower()
+        if effective_rds_proxy_mode not in (RDS_PROXY_OFF, RDS_PROXY_AUTO):
+            raise ValueError(
+                f"rds_proxy must be '{RDS_PROXY_OFF}' or '{RDS_PROXY_AUTO}', got '{rds_proxy}'"
+            )
+    else:
+        effective_rds_proxy_mode = configured_rds_proxy_mode
+
+    # RDS_API is excluded here rather than only in proxy_supports_connection: the
+    # Data API speaks HTTPS to the cluster and can never use a proxy, so running
+    # the lookup first would spend one describe_db_proxies plus N paginated
+    # describe_db_proxy_targets on a result that is then discarded. The check in
+    # proxy_supports_connection stays as the backstop.
+    if (
+        effective_rds_proxy_mode == RDS_PROXY_AUTO
+        and connection_method != ConnectionMethod.RDS_API
+    ):
+        # One lookup per target shape. RDS registers an instance with the proxy;
+        # Aurora registers the cluster, so the match key and the endpoint choice
+        # both differ -- see find_proxy_for_cluster.
+        candidate: Optional[Dict[str, Any]] = None
+        target_desc = ''
+        want_read_only = False
+        if db_instance_id:
+            candidate = find_proxy_for_instance(db_instance_id, region)
+            target_desc = f"instance '{db_instance_id}'"
+        elif cluster_identifier and cluster_proxy_eligible:
+            want_read_only = cluster_wants_read_only
+            candidate = find_proxy_for_cluster(cluster_identifier, region, want_read_only)
+            role = 'read-only' if want_read_only else 'read/write'
+            target_desc = f"cluster '{cluster_identifier}' ({role})"
+        elif cluster_identifier:
+            # A custom or member-instance endpoint. The proxy picks the backend,
+            # so it cannot honor "this specific one"; stay direct and say so.
+            logger.info(
+                f"Not using an RDS Proxy for cluster '{cluster_identifier}': "
+                f"'{db_endpoint}' is not the cluster's writer or reader endpoint, "
+                f'and a proxy cannot be asked for a specific member. Connecting '
+                f'directly.'
+            )
+
+        if candidate:
+            supported, reason = proxy_supports_connection(
+                candidate, connection_method, effective_secret_arn
+            )
+            if not supported:
+                # Found a proxy we would be rejected by. Connecting directly is
+                # what this deployment already does, so prefer that over a
+                # guaranteed failure -- but say why, since the operator asked for
+                # proxy routing and is not getting it.
+                logger.warning(
+                    f"Skipping RDS Proxy '{candidate.get('DBProxyName', '')}' for "
+                    f'{target_desc}: {reason}. Connecting directly to '
+                    f"'{db_endpoint}' instead."
+                )
+            else:
+                selected, how = select_proxy_endpoint(candidate, region, want_read_only)
+                if selected:
+                    proxy_endpoint = selected
+                    logger.info(
+                        f'RDS Proxy fronts {target_desc} and accepts this connection '
+                        f'({reason}); using the {how}, while '
+                        f"'{db_endpoint}' remains the target's identity"
+                    )
+                else:
+                    # The proxy is usable but has no endpoint for the role asked
+                    # for. Using the default would silently serve reads from the
+                    # writer, so go direct instead.
+                    logger.warning(
+                        f"Skipping RDS Proxy '{candidate.get('DBProxyName', '')}' for "
+                        f'{target_desc}: {how}. Connecting directly to '
+                        f"'{db_endpoint}' instead."
+                    )
+        elif db_instance_id or (cluster_identifier and cluster_proxy_eligible):
+            logger.info(
+                f'No usable RDS Proxy detected for {target_desc}; '
+                f"connecting directly to '{db_endpoint}'"
+            )
+
+    # Where the socket actually goes: the selected RDS Proxy endpoint when one
+    # fronts this target, otherwise the target itself. Only the PsycopgPoolConnection
+    # host/port below read these; everything that identifies the target keeps
+    # using db_endpoint and port.
+    #
+    # The port has to move with the host. RDS Proxy for PostgreSQL listens on the
+    # engine default and the DBProxy object carries no port to read, so an
+    # instance on a non-default port would otherwise be dialed on the wrong port
+    # -- and that port also feeds generate_db_auth_token, which would sign the IAM
+    # token for the wrong one.
+    connect_host = proxy_endpoint or db_endpoint
+    connect_port = PROXY_LISTEN_PORT if proxy_endpoint else port
+
     logger.debug(
         f'About to create internal DB connections with:'
         f'enable_data_api:{enable_data_api}\n'
@@ -822,6 +1379,9 @@ def internal_create_connection(
         f'effective_secret_arn:{effective_secret_arn}\n'
         f'metadata_master_username:{metadata_master_username}\n'
         f'db_endpoint:{db_endpoint}\n'
+        f'connect_host:{connect_host}\n'
+        f'connect_port:{connect_port}\n'
+        f'proxy_endpoint:{proxy_endpoint}\n'
         f'port:{port}\n'
         f'region:{region}\n'
         f'readonly:{readonly_query}'
@@ -852,14 +1412,16 @@ def internal_create_connection(
             )
 
         db_connection = PsycopgPoolConnection(
-            host=db_endpoint,
-            port=port,
+            host=connect_host,
+            port=connect_port,
             database=database,
             readonly=readonly_query,
             secret_arn='',
             db_user=iam_username,
             region=region,
             is_iam_auth=True,
+            ca_bundle_path=configured_ca_bundle,
+            sslmode=configured_sslmode,
         )
 
     elif connection_method == ConnectionMethod.RDS_API:
@@ -873,31 +1435,53 @@ def internal_create_connection(
     else:
         # must be connection_method == ConnectionMethod.PG_WIRE_PROTOCOL
         db_connection = PsycopgPoolConnection(
-            host=db_endpoint,
-            port=port,
+            host=connect_host,
+            port=connect_port,
             database=database,
             readonly=readonly_query,
             secret_arn=effective_secret_arn,
             db_user='',
             region=region,
             is_iam_auth=False,
+            ca_bundle_path=configured_ca_bundle,
+            sslmode=configured_sslmode,
         )
 
     if db_connection:
+        # NOTE: the key here uses the AWS-resolved db_endpoint (overwritten
+        # above) and omits port, so it is stored as the 5432 default. This is
+        # NOT the same key callers reconstruct in get()/remove() from their
+        # own (pre-resolution) db_endpoint/port. Do not rely on rebuilding this
+        # key to evict a specific connection — use
+        # db_connection_map.remove_connection(conn) instead. Tracked for a
+        # broader key-normalization fix (see connection-map follow-up issue).
+        #
+        # It is, however, the *instance* endpoint even when the connection was
+        # opened through an RDS Proxy — the proxy host lives in connect_host and
+        # never reaches this key. Callers therefore look this connection up with
+        # the same endpoint they passed in.
         db_connection_map.set(
             connection_method, cluster_identifier, db_endpoint, database, db_connection
         )
-        llm_response = json.dumps(
-            {
-                'connection_method': connection_method,
-                'cluster_identifier': cluster_identifier,
-                'db_endpoint': db_endpoint,
-                'database': database,
-                'port': port,
-            },
-            indent=2,
-            default=str,
-        )
+        # Record the proxy on the connection itself, so proxied-ness stays visible
+        # on paths that don't re-run the lookup: the cache-hit early return above
+        # and get_database_connection_info.
+        db_connection.proxy_endpoint = proxy_endpoint
+
+        response: Dict[str, Any] = {
+            'connection_method': connection_method,
+            'cluster_identifier': cluster_identifier,
+            'db_endpoint': db_endpoint,
+            'database': database,
+            'port': port,
+        }
+        if proxy_endpoint:
+            # Added only when a proxy is actually in use. Reported so the routing
+            # is visible, but it is NOT the handle for this connection: subsequent
+            # calls keep using db_endpoint. Omitted rather than null so its
+            # presence alone answers "is this proxied?".
+            response['proxy_endpoint'] = proxy_endpoint
+        llm_response = json.dumps(response, indent=2, default=str)
         return (db_connection, llm_response)
 
     raise ValueError("Can't create connection because invalid input parameter combination")
@@ -1072,6 +1656,19 @@ def main():
     global readonly_query
     global configured_secret_arns
     global configured_default_secret_arn
+    global privilege_check_policy
+    global configured_rds_proxy_mode
+    global configured_ca_bundle
+    global configured_sslmode
+    global startup_pg_wire_connection
+
+    # main() is normally called once, but reset this lifecycle handoff so a
+    # failed/test invocation cannot leave a stale connection for a later run.
+    startup_pg_wire_connection = None
+
+    # psycopg's async mode does not support ProactorEventLoop. Set the policy
+    # before startup validation or MCP can create an event loop.
+    _configure_windows_event_loop_policy()
 
     parser = argparse.ArgumentParser(
         description='An AWS Labs Model Context Protocol (MCP) server for postgres'
@@ -1086,10 +1683,71 @@ def main():
     parser.add_argument('--db_endpoint', help='Instance endpoint address')
     parser.add_argument('--region', help='AWS region')
     parser.add_argument(
+        '--rds_proxy',
+        choices=[RDS_PROXY_OFF, RDS_PROXY_AUTO],
+        default=RDS_PROXY_OFF,
+        help=(
+            'RDS Proxy auto-detection for standalone RDS PostgreSQL instances (RPG) '
+            "and Aurora PostgreSQL clusters (APG). 'off' (default) connects directly, "
+            "as before. 'auto' looks for an available RDS Proxy fronting the target and "
+            'connects through it when one is found that accepts the connection method '
+            'and secret in use. For a cluster, the proxy endpoint is chosen to match '
+            'the cluster endpoint supplied: writer to the default endpoint, reader to a '
+            'READ_ONLY proxy endpoint; a custom or member-instance endpoint always '
+            'connects directly. Opt-in because routing through a proxy can turn a '
+            "working direct connection into a failure: the proxy's Auth config may not "
+            'register the secret, its IAMAuth mode may not match the connection method, '
+            'an rds-db:connect policy scoped to the instance will not authorize the '
+            'proxy (prx-*), and the proxy may not be reachable from a host that can '
+            'reach the target. Needs rds:DescribeDBProxies and '
+            'rds:DescribeDBProxyTargets, plus rds:DescribeDBProxyEndpoints for Aurora '
+            'read-only routing.'
+        ),
+    )
+    parser.add_argument(
+        '--privilege_check',
+        choices=[PRIVILEGE_CHECK_ENFORCE, PRIVILEGE_CHECK_WARN, PRIVILEGE_CHECK_OFF],
+        default=PRIVILEGE_CHECK_WARN,
+        help=(
+            'Least-privilege guardrail applied when a database connection is established. '
+            "'warn' (default) logs a warning but allows a connection whose Postgres role is a "
+            "superuser or a member of rds_superuser; 'enforce' rejects it (recommended for "
+            "production); 'off' skips the check. Use a dedicated least-privilege role "
+            '(see README) and set enforce rather than operating as a superuser.'
+        ),
+    )
+    parser.add_argument(
         '--allow_write_query', action='store_true', help='Enforce readonly SQL statements'
     )
     parser.add_argument('--database', help='Database name')
     parser.add_argument('--port', type=int, default=5432, help='Database port (default: 5432)')
+    parser.add_argument(
+        '--sslmode',
+        choices=ALLOWED_SSLMODES,
+        default=DEFAULT_SSLMODE,
+        help=(
+            'TLS mode for direct (psycopg / PG Wire) connections. The connection '
+            'is always encrypted; this tunes certificate verification: '
+            "'verify-full' (default) verifies the CA chain and the hostname; "
+            "'verify-ca' verifies the CA chain but not the hostname (use for "
+            'IP/tunnel/CNAME endpoints that will not match the certificate); '
+            "'require' encrypts but does not verify the certificate (e.g. a "
+            'self-signed cert you do not want to validate). Plaintext modes are '
+            'not offered.'
+        ),
+    )
+    parser.add_argument(
+        '--ca_bundle',
+        default=None,
+        help=(
+            'CA bundle for certificate verification on psycopg (PG Wire) '
+            "connections when --sslmode is 'verify-ca' or 'verify-full'. Either a "
+            'path to a PEM file (e.g. a private CA for self-hosted PostgreSQL) or '
+            "the literal 'system' to use the OS trust store. Overrides the bundled "
+            'combined AWS CA bundle (RDS private CAs + public Amazon roots) shipped '
+            "with the package. Ignored when --sslmode is 'require'."
+        ),
+    )
     parser.add_argument(
         '--secret_arn',
         required=False,
@@ -1166,6 +1824,26 @@ def main():
     )
 
     readonly_query = not args.allow_write_query
+    privilege_check_policy = args.privilege_check
+    configured_rds_proxy_mode = args.rds_proxy
+    configured_ca_bundle = args.ca_bundle
+    configured_sslmode = args.sslmode
+    # Surface a reduced TLS posture so operators/auditors can see it in logs.
+    # The connection is still encrypted (plaintext modes are not offered), but
+    # any mode below the default (verify-full) verifies less of the server's
+    # identity: 'verify-ca' skips the hostname check, 'require' skips
+    # certificate verification entirely.
+    if configured_sslmode != DEFAULT_SSLMODE:
+        logger.warning(
+            f'TLS certificate verification reduced: --sslmode={configured_sslmode} '
+            f'(default is {DEFAULT_SSLMODE}). Connections remain encrypted, but '
+            'the server certificate is '
+            + (
+                'not verified.'
+                if configured_sslmode == 'require'
+                else 'verified without a hostname check.'
+            )
+        )
     configured_secret_arns.clear()
     configured_secret_arns.update(secret_arn_map)
     configured_default_secret_arn = default_secret_arn
@@ -1203,37 +1881,51 @@ def main():
                 database=args.database,
             )
 
-            # Test database connection
+            # Validate the database connection: connectivity plus the
+            # least-privilege guardrail. Under 'enforce' a superuser /
+            # rds_superuser connection aborts startup; under the default
+            # 'warn' it is allowed with a logged warning.
             if db_connection:
-                ctx = DummyCtx()
-                response = asyncio.run(
-                    run_query(
-                        'SELECT 1',
-                        ctx,
-                        ConnectionMethod[args.connection_method],
-                        cluster_identifier,
-                        args.db_endpoint,
-                        args.database,
-                    )
-                )
-                if (
-                    isinstance(response, list)
-                    and len(response) == 1
-                    and isinstance(response[0], dict)
-                    and 'error' in response[0]
-                ):
-                    logger.error(
-                        'Failed to validate database connection to Postgres. Exit the MCP server'
-                    )
-                    sys.exit(1)
+                if _startup_validation_uses_serving_loop(db_connection):
+                    # Defer loop-affine validation to the MCP lifespan. Running
+                    # it through asyncio.run() here would bind the pool and
+                    # RWLock to a temporary loop that closes before mcp.run().
+                    startup_pg_wire_connection = db_connection
                 else:
-                    logger.success('Successfully validated database connection to Postgres')
+                    try:
+                        asyncio.run(validate_connection(db_connection, privilege_check_policy))
+                        logger.success('Successfully validated database connection to Postgres')
+                    except ConnectionValidationError as e:
+                        # The exception message carries its own remediation: an
+                        # over-privileged rejection mentions the --privilege_check
+                        # override, while a connectivity/unverifiable failure does
+                        # not (relaxing the policy would not make an unreachable DB
+                        # reachable).
+                        logger.error(f'Refusing to start: {e}')
+                        sys.exit(1)
+                    except Exception as e:
+                        logger.error(
+                            f'Failed to validate database connection to Postgres: {e}. '
+                            'Exit the MCP server'
+                        )
+                        sys.exit(1)
 
         logger.info('Postgres MCP server started')
-        mcp.run()
+        try:
+            mcp.run()
+        except (_StartupRefusedError, BaseExceptionGroup) as e:
+            # stdio's AnyIO task group wraps lifespan failures. Translate only
+            # deliberate startup refusals after those task groups have unwound;
+            # an unrelated failure (even in a mixed group) must retain its traceback.
+            if not _is_startup_refusal(e):
+                raise
+            raise SystemExit(1) from None
         logger.info('Postgres MCP server stopped')
     finally:
+        # The lifespan closes loop-bound pools on MCP's serving loop. Keep this
+        # synchronous fallback for exits before that lifespan is entered.
         db_connection_map.close_all()
+        startup_pg_wire_connection = None
 
 
 if __name__ == '__main__':

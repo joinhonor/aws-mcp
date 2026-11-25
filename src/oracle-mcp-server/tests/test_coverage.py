@@ -38,19 +38,23 @@ from awslabs.oracle_mcp_server.server import (
     server_config,
 )
 from botocore.exceptions import ClientError
+from mcp.server.mcpserver import Context
+from typing import Any, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 
-class DummyCtx:
+class DummyCtx(Context):
     """Minimal context stub used to capture error messages."""
 
-    def __init__(self):
-        """Record messages emitted via ctx.error for assertions."""
-        self.errors = []
+    errors: List[Any] = []
 
-    async def error(self, message):
+    def __init__(self) -> None:
+        """Initialize with no request context; nothing here needs one."""
+        super().__init__()
+
+    async def error(self, data: Any, *, logger_name: Optional[str] = None):
         """Capture the error message."""
-        self.errors.append(message)
+        self.errors.append(data)
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +63,8 @@ def _reset_server_config():
     defaults = ServerConfig()
     yield
     server_config.readonly_query = defaults.readonly_query
-    server_config.default_secret_arn = defaults.default_secret_arn
+    server_config.configured_secret_arns = defaults.configured_secret_arns
+    server_config.configured_default_secret_arn = defaults.configured_default_secret_arn
     server_config.ssl_encryption_mode = defaults.ssl_encryption_mode
     server_config.configured_port = defaults.configured_port
     server_config.max_rows = defaults.max_rows
@@ -75,14 +80,14 @@ def _reset_server_config():
 async def test_run_query_injection_risk_returns_error(mocker):
     """Injection-risk pattern is rejected before the query reaches the DB."""
     from awslabs.oracle_mcp_server.server import run_query
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     mock_conn = MagicMock()
     mock_conn.readonly_query = False  # skip the readonly branch
     mocker.patch.object(db_connection_map, 'get', return_value=mock_conn)
     ctx = DummyCtx()
 
-    with pytest.raises(McpError):
+    with pytest.raises(MCPError):
         await run_query(
             sql="EXECUTE IMMEDIATE 'DROP TABLE t'",
             ctx=ctx,
@@ -153,12 +158,12 @@ async def test_run_query_generic_exception_returns_error(mocker):
 
 @pytest.mark.asyncio
 async def test_get_table_schema_invalid_name_raises_mcp_error():
-    """An invalid table name triggers an McpError before any DB call."""
+    """An invalid table name triggers an MCPError before any DB call."""
     from awslabs.oracle_mcp_server.server import get_table_schema
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     ctx = DummyCtx()
-    with pytest.raises(McpError):
+    with pytest.raises(MCPError):
         await get_table_schema(
             connection_method=ConnectionMethod.ORACLE_PASSWORD,
             db_endpoint='ep1',
@@ -208,7 +213,7 @@ def test_get_database_connection_info_returns_map_keys(mocker):
 
 
 def test_internal_create_connection_without_secret_uses_rds_describe(mocker):
-    """When no secret_arn is supplied, fall back to RDS describe_db_instances."""
+    """When no --secret_arn is configured, fall back to RDS describe_db_instances."""
     mocker.patch.object(db_connection_map, 'get', return_value=None)
     mocker.patch.object(db_connection_map, 'set')
 
@@ -233,7 +238,6 @@ def test_internal_create_connection_without_secret_uses_rds_describe(mocker):
         port=1521,
         database='ORCL',
         service_name='ORCL',
-        secret_arn=None,  # force fallback
     )
 
     assert isinstance(conn, OracledbPoolConnection)
@@ -617,7 +621,7 @@ def test_get_credentials_from_secret_missing_username(mocker):
     mock_session.client.return_value = mock_sm
     mocker.patch('boto3.Session', return_value=mock_session)
 
-    with pytest.raises(ValueError, match='does not contain username'):
+    with pytest.raises(ValueError, match='no usable username value'):
         conn._get_credentials_from_secret('arn:any', 'us-east-1')
 
 
@@ -631,7 +635,7 @@ def test_get_credentials_from_secret_missing_password(mocker):
     mock_session.client.return_value = mock_sm
     mocker.patch('boto3.Session', return_value=mock_session)
 
-    with pytest.raises(ValueError, match='does not contain password'):
+    with pytest.raises(ValueError, match='no usable password value'):
         conn._get_credentials_from_secret('arn:any', 'us-east-1')
 
 
